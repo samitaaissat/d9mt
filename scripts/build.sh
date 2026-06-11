@@ -95,11 +95,10 @@ i686-w64-mingw32-gcc -O2 \
   "$ROOT/test/triangle.c" \
   -ld3d9 -luser32 -lgdi32
 
-# shadertri needs SM3 bytecode produced by hlsl2dxso.exe under wine
-# (test/shadertri_*.hlsl); skipped if the blobs are absent
-if [[ -f "$BUILD/shadertri_vs.vso" && -f "$BUILD/shadertri_ps.pso" ]]; then
-  echo "[build] embedding shadertri bytecode + compiling shadertri.exe"
-  python3 - "$BUILD/shadertri_vs.vso" "$BUILD/shadertri_vs_bytecode.h" shadertri_vs_bytecode <<'EOF'
+# shader test apps need SM3 bytecode produced by hlsl2dxso.exe under wine
+# (test/<name>_*.hlsl); each is skipped if its blobs are absent
+embed_blob() { # <blob> <header> <symbol>
+  python3 - "$1" "$2" "$3" <<'EOF'
 import sys
 data = open(sys.argv[1], 'rb').read()
 with open(sys.argv[2], 'w') as f:
@@ -108,21 +107,24 @@ with open(sys.argv[2], 'w') as f:
         f.write("  " + ",".join(str(b) for b in data[i:i+16]) + ",\n")
     f.write("};\n")
 EOF
-  python3 - "$BUILD/shadertri_ps.pso" "$BUILD/shadertri_ps_bytecode.h" shadertri_ps_bytecode <<'EOF'
-import sys
-data = open(sys.argv[1], 'rb').read()
-with open(sys.argv[2], 'w') as f:
-    f.write(f"static const unsigned char {sys.argv[3]}[] = {{\n")
-    for i in range(0, len(data), 16):
-        f.write("  " + ",".join(str(b) for b in data[i:i+16]) + ",\n")
-    f.write("};\n")
-EOF
-  i686-w64-mingw32-gcc -O2 \
-    -o "$BUILD/shadertri.exe" \
-    "$ROOT/test/shadertri.c" \
-    -I "$BUILD" \
-    -ld3d9 -luser32 -lgdi32
-fi
+}
+
+build_shader_test() { # <name>
+  local name="$1"
+  if [[ -f "$BUILD/${name}_vs.vso" && -f "$BUILD/${name}_ps.pso" ]]; then
+    echo "[build] embedding $name bytecode + compiling $name.exe"
+    embed_blob "$BUILD/${name}_vs.vso" "$BUILD/${name}_vs_bytecode.h" "${name}_vs_bytecode"
+    embed_blob "$BUILD/${name}_ps.pso" "$BUILD/${name}_ps_bytecode.h" "${name}_ps_bytecode"
+    i686-w64-mingw32-gcc -O2 \
+      -o "$BUILD/$name.exe" \
+      "$ROOT/test/$name.c" \
+      -I "$BUILD" \
+      -ld3d9 -luser32 -lgdi32
+  fi
+}
+
+build_shader_test shadertri
+build_shader_test texquad
 
 echo "[build] done:"
 ls -la "$BUILD/d3d9.dll" "$BUILD/triangle.exe"

@@ -76,6 +76,9 @@ static void log_nserror(const char *what, obj_handle_t err) {
 static constexpr uint32_t STREAM_BUFFER_BASE = 16;
 static constexpr UINT MAX_STREAMS = 8;
 static constexpr UINT RING_SIZE = 8u << 20; // per-frame upload ring
+static constexpr UINT MAX_SAMPLERS = 16;    // PS samplers s0-s15
+static constexpr UINT MAX_SAMPLER_STATES = 14; // D3DSAMP_* max + 1
+static constexpr UINT SAMPLER_HEAP_SLOTS = 64; // distinct sampler states
 
 // matches the render_state_t push block spirv-cross emits for the DXVK
 // dxso shaders (see build/test_*.metal); sampler words pack two u16 heap
@@ -116,6 +119,74 @@ static uint32_t decltype_to_mtl(BYTE type) {
   case D3DDECLTYPE_FLOAT16_2: return 25; // Half2
   case D3DDECLTYPE_FLOAT16_4: return 27;
   default:                    return 0;
+  }
+}
+
+// D3DFORMAT -> WMTPixelFormat plus the layout info LockRect needs.
+// blockDim 1 = plain linear formats; 4 = BC (DXT) 4x4 blocks.
+// Formats whose D3D9 sample semantics differ from the raw Metal format
+// (X* alpha-is-one, luminance replication, A4R4G4B4 component order, ...)
+// get a swizzled texture view; the channel mappings mirror DXVK's
+// ConvertFormatUnfixed (d3d9_format.cpp) VkComponentMapping table.
+struct D9MTFormatInfo {
+  uint32_t wmt;
+  UINT bytesPerBlock;
+  UINT blockDim;
+  bool swizzled;
+  WMTTextureSwizzleChannels swizzle;
+};
+
+static bool d3dfmt_to_wmt(D3DFORMAT fmt, D9MTFormatInfo *out) {
+  constexpr WMTTextureSwizzle R = WMTTextureSwizzleRed;
+  constexpr WMTTextureSwizzle G = WMTTextureSwizzleGreen;
+  constexpr WMTTextureSwizzle B = WMTTextureSwizzleBlue;
+  constexpr WMTTextureSwizzle A = WMTTextureSwizzleAlpha;
+  constexpr WMTTextureSwizzle ONE = WMTTextureSwizzleOne;
+  auto plain = [out](uint32_t w, UINT bpb, UINT bd = 1) {
+    *out = {w, bpb, bd, false, {}};
+    return true;
+  };
+  auto swiz = [out](uint32_t w, UINT bpb, WMTTextureSwizzle r,
+                    WMTTextureSwizzle g, WMTTextureSwizzle b,
+                    WMTTextureSwizzle a) {
+    *out = {w, bpb, 1, true, {r, g, b, a}};
+    return true;
+  };
+  switch ((DWORD)fmt) {
+  case D3DFMT_A8R8G8B8:      return plain(WMTPixelFormatBGRA8Unorm, 4);
+  case D3DFMT_X8R8G8B8:      return swiz(WMTPixelFormatBGRA8Unorm, 4, R, G, B, ONE);
+  case D3DFMT_A8B8G8R8:      return plain(WMTPixelFormatRGBA8Unorm, 4);
+  case D3DFMT_X8B8G8R8:      return swiz(WMTPixelFormatRGBA8Unorm, 4, R, G, B, ONE);
+  case D3DFMT_R5G6B5:        return plain(WMTPixelFormatB5G6R5Unorm, 2);
+  case D3DFMT_A1R5G5B5:      return plain(WMTPixelFormatBGR5A1Unorm, 2);
+  case D3DFMT_X1R5G5B5:      return swiz(WMTPixelFormatBGR5A1Unorm, 2, R, G, B, ONE);
+  // D3D A4R4G4B4 in ABGR4 bit order: components land at (G,B,A,R), the
+  // same trick as winemetal's synthetic WMTPixelFormatBGRA4Unorm
+  case D3DFMT_A4R4G4B4:      return swiz(WMTPixelFormatABGR4Unorm, 2, G, B, A, R);
+  case D3DFMT_X4R4G4B4:      return swiz(WMTPixelFormatABGR4Unorm, 2, G, B, A, ONE);
+  case D3DFMT_A8:            return plain(WMTPixelFormatA8Unorm, 1);
+  case D3DFMT_L8:            return swiz(WMTPixelFormatR8Unorm, 1, R, R, R, ONE);
+  case D3DFMT_A8L8:          return swiz(WMTPixelFormatRG8Unorm, 2, R, R, R, G);
+  case D3DFMT_L16:           return swiz(WMTPixelFormatR16Unorm, 2, R, R, R, ONE);
+  case D3DFMT_V8U8:          return swiz(WMTPixelFormatRG8Snorm, 2, R, G, ONE, ONE);
+  case D3DFMT_Q8W8V8U8:      return plain(WMTPixelFormatRGBA8Snorm, 4);
+  case D3DFMT_V16U16:        return swiz(WMTPixelFormatRG16Snorm, 4, R, G, ONE, ONE);
+  case D3DFMT_G16R16:        return swiz(WMTPixelFormatRG16Unorm, 4, R, G, ONE, ONE);
+  case D3DFMT_A16B16G16R16:  return plain(WMTPixelFormatRGBA16Unorm, 8);
+  case D3DFMT_A2B10G10R10:   return plain(WMTPixelFormatRGB10A2Unorm, 4);
+  case D3DFMT_A2R10G10B10:   return plain(WMTPixelFormatBGR10A2Unorm, 4);
+  case D3DFMT_R16F:          return swiz(WMTPixelFormatR16Float, 2, R, ONE, ONE, ONE);
+  case D3DFMT_G16R16F:       return swiz(WMTPixelFormatRG16Float, 4, R, G, ONE, ONE);
+  case D3DFMT_A16B16G16R16F: return plain(WMTPixelFormatRGBA16Float, 8);
+  case D3DFMT_R32F:          return swiz(WMTPixelFormatR32Float, 4, R, ONE, ONE, ONE);
+  case D3DFMT_G32R32F:       return swiz(WMTPixelFormatRG32Float, 8, R, G, ONE, ONE);
+  case D3DFMT_A32B32G32R32F: return plain(WMTPixelFormatRGBA32Float, 16);
+  case D3DFMT_DXT1:          return plain(WMTPixelFormatBC1_RGBA, 8, 4);
+  case D3DFMT_DXT2: // premultiplied variants share the block format
+  case D3DFMT_DXT3:          return plain(WMTPixelFormatBC2_RGBA, 16, 4);
+  case D3DFMT_DXT4:
+  case D3DFMT_DXT5:          return plain(WMTPixelFormatBC3_RGBA, 16, 4);
+  default:                   return false;
   }
 }
 
@@ -378,6 +449,285 @@ using D9MTVertexShader = D9MTShaderBase<IDirect3DVertexShader9>;
 using D9MTPixelShader = D9MTShaderBase<IDirect3DPixelShader9>;
 
 // ---------------------------------------------------------------------------
+// textures
+// ---------------------------------------------------------------------------
+
+class D9MTSurface;
+
+// 2D texture: shared-storage MTLTexture with the full mip chain, plus a
+// sysmem staging copy. LockRect hands out staging memory; UnlockRect
+// uploads the level with replaceRegion.
+class D9MTTexture final : public IDirect3DTexture9 {
+public:
+  D9MTTexture(IDirect3DDevice9 *dev, UINT width, UINT height, UINT levels,
+              D3DFORMAT format, const D9MTFormatInfo &fi)
+      : m_device(dev), m_width(width), m_height(height), m_format(format),
+        m_fmtInfo(fi) {
+    if (!levels) { // 0 = full chain down to 1x1
+      UINT dim = width > height ? width : height;
+      for (levels = 1; dim > 1; dim >>= 1)
+        levels++;
+    }
+    m_levels = levels;
+    UINT off = 0;
+    for (UINT l = 0; l < m_levels; l++) {
+      m_levelOffset.push_back(off);
+      off += RowBytes(l) * Rows(l);
+    }
+    m_staging.resize(off);
+    m_surfaces.resize(m_levels, nullptr);
+  }
+  ~D9MTTexture();
+
+  bool Create(obj_handle_t mtlDevice) {
+    WMTTextureInfo info = {};
+    info.pixel_format = (WMTPixelFormat)m_fmtInfo.wmt;
+    info.width = m_width;
+    info.height = m_height;
+    info.depth = 1;
+    info.array_length = 1;
+    info.type = WMTTextureType2D;
+    info.mipmap_level_count = m_levels;
+    info.sample_count = 1;
+    info.usage = WMTTextureUsageShaderRead;
+    if (m_fmtInfo.swizzled)
+      info.usage = (WMTTextureUsage)(info.usage | WMTTextureUsagePixelFormatView);
+    info.options = WMTResourceStorageModeShared;
+    m_tex = MTLDevice_newTexture(mtlDevice, &info);
+    if (!m_tex)
+      return false;
+    m_gpuId = info.gpu_resource_id;
+    if (m_fmtInfo.swizzled) {
+      // shaders sample through a view carrying the D3D9 channel mapping;
+      // uploads still go to the plain base texture
+      m_view = MTLTexture_newTextureView(
+          m_tex, (WMTPixelFormat)m_fmtInfo.wmt, WMTTextureType2D, 0, m_levels,
+          0, 1, m_fmtInfo.swizzle, &m_gpuId);
+      if (!m_view)
+        return false;
+    }
+    return true;
+  }
+
+  // what PrepareDraw binds: the swizzled view when there is one
+  obj_handle_t SampleHandle() const { return m_view ? m_view : m_tex; }
+
+  UINT LevelWidth(UINT l) const { return m_width >> l ? m_width >> l : 1; }
+  UINT LevelHeight(UINT l) const { return m_height >> l ? m_height >> l : 1; }
+  UINT RowBytes(UINT l) const {
+    UINT w = LevelWidth(l);
+    return m_fmtInfo.blockDim == 1
+               ? w * m_fmtInfo.bytesPerBlock
+               : ((w + 3) / 4) * m_fmtInfo.bytesPerBlock;
+  }
+  UINT Rows(UINT l) const {
+    UINT h = LevelHeight(l);
+    return m_fmtInfo.blockDim == 1 ? h : (h + 3) / 4;
+  }
+
+  // IUnknown
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+    if (!ppv)
+      return E_POINTER;
+    *ppv = this;
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    return InterlockedIncrement(&m_refcount);
+  }
+  ULONG STDMETHODCALLTYPE Release() override {
+    ULONG r = InterlockedDecrement(&m_refcount);
+    if (!r)
+      delete this;
+    return r;
+  }
+
+  // IDirect3DResource9
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) override {
+    if (!ppDevice)
+      return D3DERR_INVALIDCALL;
+    m_device->AddRef();
+    *ppDevice = m_device;
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, const void *, DWORD,
+                                           DWORD) override {
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, void *, DWORD *) override {
+    return D3DERR_NOTFOUND;
+  }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID) override { return D3D_OK; }
+  DWORD STDMETHODCALLTYPE SetPriority(DWORD) override { return 0; }
+  DWORD STDMETHODCALLTYPE GetPriority() override { return 0; }
+  void STDMETHODCALLTYPE PreLoad() override {}
+  D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override {
+    return D3DRTYPE_TEXTURE;
+  }
+
+  // IDirect3DBaseTexture9
+  DWORD STDMETHODCALLTYPE SetLOD(DWORD) override { return 0; }
+  DWORD STDMETHODCALLTYPE GetLOD() override { return 0; }
+  DWORD STDMETHODCALLTYPE GetLevelCount() override { return m_levels; }
+  HRESULT STDMETHODCALLTYPE
+  SetAutoGenFilterType(D3DTEXTUREFILTERTYPE) override {
+    return D3D_OK;
+  }
+  D3DTEXTUREFILTERTYPE STDMETHODCALLTYPE GetAutoGenFilterType() override {
+    return D3DTEXF_LINEAR;
+  }
+  void STDMETHODCALLTYPE GenerateMipSubLevels() override {
+    STUB_ONCE("GenerateMipSubLevels");
+  }
+
+  // IDirect3DTexture9
+  HRESULT STDMETHODCALLTYPE GetLevelDesc(UINT Level,
+                                         D3DSURFACE_DESC *pDesc) override {
+    if (!pDesc || Level >= m_levels)
+      return D3DERR_INVALIDCALL;
+    pDesc->Format = m_format;
+    pDesc->Type = D3DRTYPE_SURFACE;
+    pDesc->Usage = 0;
+    pDesc->Pool = D3DPOOL_MANAGED;
+    pDesc->MultiSampleType = D3DMULTISAMPLE_NONE;
+    pDesc->MultiSampleQuality = 0;
+    pDesc->Width = LevelWidth(Level);
+    pDesc->Height = LevelHeight(Level);
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetSurfaceLevel(
+      UINT Level, IDirect3DSurface9 **ppSurfaceLevel) override;
+  HRESULT STDMETHODCALLTYPE LockRect(UINT Level, D3DLOCKED_RECT *pLockedRect,
+                                     const RECT *pRect,
+                                     DWORD Flags) override {
+    if (!pLockedRect || Level >= m_levels)
+      return D3DERR_INVALIDCALL;
+    uint8_t *base = m_staging.data() + m_levelOffset[Level];
+    pLockedRect->Pitch = (INT)RowBytes(Level);
+    if (pRect) {
+      UINT bx = (pRect->left / m_fmtInfo.blockDim) * m_fmtInfo.bytesPerBlock;
+      UINT by = pRect->top / m_fmtInfo.blockDim;
+      base += by * RowBytes(Level) + bx;
+    }
+    pLockedRect->pBits = base;
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE UnlockRect(UINT Level) override {
+    if (Level >= m_levels || !m_tex)
+      return D3DERR_INVALIDCALL;
+    WMTOrigin origin = {0, 0, 0};
+    WMTSize size = {LevelWidth(Level), LevelHeight(Level), 1};
+    WMTMemoryPointer data;
+    data.set(m_staging.data() + m_levelOffset[Level]);
+    MTLTexture_replaceRegion(m_tex, origin, size, Level, 0, data,
+                             RowBytes(Level), 0);
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE AddDirtyRect(const RECT *) override {
+    return D3D_OK;
+  }
+
+  obj_handle_t m_tex = 0;
+  obj_handle_t m_view = 0; // swizzled view, when the format needs one
+  uint64_t m_gpuId = 0;    // of the handle shaders sample (view if present)
+
+private:
+  volatile LONG m_refcount = 1;
+  IDirect3DDevice9 *m_device;
+  UINT m_width, m_height, m_levels = 1;
+  D3DFORMAT m_format;
+  D9MTFormatInfo m_fmtInfo;
+  std::vector<uint8_t> m_staging;
+  std::vector<UINT> m_levelOffset;
+  std::vector<D9MTSurface *> m_surfaces; // lazily created, share our refcount
+};
+
+// Mip-level view. Per D3D9 semantics it shares the container's refcount:
+// AddRef/Release forward to the texture, which owns and deletes it.
+class D9MTSurface final : public IDirect3DSurface9 {
+public:
+  D9MTSurface(D9MTTexture *parent, UINT level)
+      : m_parent(parent), m_level(level) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+    if (!ppv)
+      return E_POINTER;
+    *ppv = this;
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return m_parent->AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() override { return m_parent->Release(); }
+
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) override {
+    return m_parent->GetDevice(ppDevice);
+  }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, const void *, DWORD,
+                                           DWORD) override {
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, void *, DWORD *) override {
+    return D3DERR_NOTFOUND;
+  }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID) override { return D3D_OK; }
+  DWORD STDMETHODCALLTYPE SetPriority(DWORD) override { return 0; }
+  DWORD STDMETHODCALLTYPE GetPriority() override { return 0; }
+  void STDMETHODCALLTYPE PreLoad() override {}
+  D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override {
+    return D3DRTYPE_SURFACE;
+  }
+
+  HRESULT STDMETHODCALLTYPE GetContainer(REFIID, void **ppContainer) override {
+    if (!ppContainer)
+      return D3DERR_INVALIDCALL;
+    m_parent->AddRef();
+    *ppContainer = m_parent;
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE GetDesc(D3DSURFACE_DESC *pDesc) override {
+    return m_parent->GetLevelDesc(m_level, pDesc);
+  }
+  HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT *pLockedRect,
+                                     const RECT *pRect, DWORD Flags) override {
+    return m_parent->LockRect(m_level, pLockedRect, pRect, Flags);
+  }
+  HRESULT STDMETHODCALLTYPE UnlockRect() override {
+    return m_parent->UnlockRect(m_level);
+  }
+  HRESULT STDMETHODCALLTYPE GetDC(HDC *) override {
+    return D3DERR_INVALIDCALL;
+  }
+  HRESULT STDMETHODCALLTYPE ReleaseDC(HDC) override {
+    return D3DERR_INVALIDCALL;
+  }
+
+private:
+  D9MTTexture *m_parent;
+  UINT m_level;
+};
+
+D9MTTexture::~D9MTTexture() {
+  for (D9MTSurface *s : m_surfaces)
+    delete s;
+  if (m_view)
+    NSObject_release(m_view);
+  if (m_tex)
+    NSObject_release(m_tex);
+}
+
+HRESULT D9MTTexture::GetSurfaceLevel(UINT Level,
+                                     IDirect3DSurface9 **ppSurfaceLevel) {
+  if (!ppSurfaceLevel || Level >= m_levels)
+    return D3DERR_INVALIDCALL;
+  if (!m_surfaces[Level])
+    m_surfaces[Level] = new D9MTSurface(this, Level);
+  AddRef(); // surfaces share the container refcount
+  *ppSurfaceLevel = m_surfaces[Level];
+  return D3D_OK;
+}
+
+// ---------------------------------------------------------------------------
 // device
 // ---------------------------------------------------------------------------
 
@@ -394,7 +744,17 @@ class D9MTInterface;
 class D9MTDevice final : public IDirect3DDevice9 {
 public:
   D9MTDevice(D9MTInterface *parent, HWND hwnd, UINT width, UINT height)
-      : m_parent(parent), m_hwnd(hwnd), m_width(width), m_height(height) {}
+      : m_parent(parent), m_hwnd(hwnd), m_width(width), m_height(height) {
+    for (UINT s = 0; s < MAX_SAMPLERS; s++) {
+      m_samplerStates[s][D3DSAMP_ADDRESSU] = D3DTADDRESS_WRAP;
+      m_samplerStates[s][D3DSAMP_ADDRESSV] = D3DTADDRESS_WRAP;
+      m_samplerStates[s][D3DSAMP_ADDRESSW] = D3DTADDRESS_WRAP;
+      m_samplerStates[s][D3DSAMP_MAGFILTER] = D3DTEXF_POINT;
+      m_samplerStates[s][D3DSAMP_MINFILTER] = D3DTEXF_POINT;
+      m_samplerStates[s][D3DSAMP_MIPFILTER] = D3DTEXF_NONE;
+      m_samplerStates[s][D3DSAMP_MAXANISOTROPY] = 1;
+    }
+  }
 
   HRESULT Init();
   ~D9MTDevice();
@@ -497,13 +857,30 @@ public:
   void STDMETHODCALLTYPE GetGammaRamp(UINT iSwapChain,
                                       D3DGAMMARAMP *pRamp) override {}
 
-  // resource creation: all unsupported in MVP
   HRESULT STDMETHODCALLTYPE CreateTexture(
       UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format,
       D3DPOOL Pool, IDirect3DTexture9 **ppTexture,
       HANDLE *pSharedHandle) override {
-    STUB_ONCE("CreateTexture");
-    return D3DERR_NOTAVAILABLE;
+    if (!ppTexture || !Width || !Height)
+      return D3DERR_INVALIDCALL;
+    D9MTFormatInfo fi;
+    if (!d3dfmt_to_wmt(Format, &fi)) {
+      log_msg("CreateTexture: unsupported format %u", (unsigned)Format);
+      return D3DERR_NOTAVAILABLE;
+    }
+    if (Usage & D3DUSAGE_RENDERTARGET) {
+      STUB_ONCE("CreateTexture: render target");
+      return D3DERR_NOTAVAILABLE;
+    }
+    D9MTTexture *tex = new D9MTTexture(this, Width, Height, Levels, Format, fi);
+    if (!tex->Create(m_mtlDevice)) {
+      log_msg("CreateTexture: newTexture failed (%ux%u fmt %u)", Width, Height,
+              (unsigned)Format);
+      tex->Release();
+      return D3DERR_OUTOFVIDEOMEMORY;
+    }
+    *ppTexture = tex;
+    return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE CreateVolumeTexture(
       UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage,
@@ -736,12 +1113,25 @@ public:
   }
   HRESULT STDMETHODCALLTYPE
   GetTexture(DWORD Stage, IDirect3DBaseTexture9 **ppTexture) override {
-    if (ppTexture)
-      *ppTexture = nullptr;
+    if (!ppTexture)
+      return D3DERR_INVALIDCALL;
+    *ppTexture = Stage < MAX_SAMPLERS ? m_textures[Stage] : nullptr;
+    if (*ppTexture)
+      (*ppTexture)->AddRef();
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE
   SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) override {
+    if (Stage >= MAX_SAMPLERS) {
+      STUB_ONCE("SetTexture: vertex/displacement sampler");
+      return D3D_OK;
+    }
+    if (pTexture && pTexture->GetType() != D3DRTYPE_TEXTURE) {
+      STUB_ONCE("SetTexture: non-2D texture");
+      m_textures[Stage] = nullptr;
+      return D3D_OK;
+    }
+    m_textures[Stage] = static_cast<D9MTTexture *>(pTexture);
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE
@@ -759,13 +1149,18 @@ public:
   HRESULT STDMETHODCALLTYPE GetSamplerState(DWORD Sampler,
                                             D3DSAMPLERSTATETYPE Type,
                                             DWORD *pValue) override {
-    if (pValue)
-      *pValue = 0;
+    if (!pValue)
+      return D3DERR_INVALIDCALL;
+    *pValue = (Sampler < MAX_SAMPLERS && Type < MAX_SAMPLER_STATES)
+                  ? m_samplerStates[Sampler][Type]
+                  : 0;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE SetSamplerState(DWORD Sampler,
                                             D3DSAMPLERSTATETYPE Type,
                                             DWORD Value) override {
+    if (Sampler < MAX_SAMPLERS && Type < MAX_SAMPLER_STATES)
+      m_samplerStates[Sampler][Type] = Value;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE ValidateDevice(DWORD *pNumPasses) override {
@@ -1150,6 +1545,24 @@ private:
   };
   std::vector<std::pair<PsoKey, obj_handle_t>> m_psoCache;
 
+  // --- textures + samplers ---
+  D9MTTexture *m_textures[MAX_SAMPLERS] = {}; // not ref'd (MVP, like m_vs/m_ps)
+  DWORD m_samplerStates[MAX_SAMPLERS][MAX_SAMPLER_STATES] = {};
+
+  // one MTLSamplerState per distinct D3D9 sampler state vector; its
+  // gpu_resource_id lives at heapIndex in the static sampler heap region
+  // and shaders pick it via render_state.sN_idx
+  struct SamplerEntry {
+    uint64_t key;
+    obj_handle_t handle;
+  };
+  std::vector<SamplerEntry> m_samplers;
+  UINT m_samplerHeapOffset = 0; // static ring region: SAMPLER_HEAP_SLOTS u64s
+
+  // textures made resident this frame (their MTLTextures live outside the
+  // ring, so each needs its own UseResource)
+  std::vector<obj_handle_t> m_frameResident;
+
   template <typename T> T *AppendCmd(uint16_t type) {
     m_cmds.emplace_back();
     T *c = reinterpret_cast<T *>(m_cmds.back().raw);
@@ -1178,6 +1591,8 @@ private:
 
   HRESULT CompileShader(const DWORD *pFunction, D9MTShaderData &data);
   obj_handle_t GetOrCreatePso();
+  uint32_t GetOrCreateSampler(UINT slot);
+  void MarkResident(obj_handle_t res);
   bool PrepareDraw();
 };
 
@@ -1309,6 +1724,11 @@ HRESULT D9MTDevice::Init() {
     // clip_info: 6 zeroed user clip planes
     float *clip = (float *)RingAlloc(6 * 16, &m_clipInfoOffset);
     memset(clip, 0, 6 * 16);
+    // sampler heap: gpu_resource_ids of created MTLSamplerStates, filled
+    // by GetOrCreateSampler as states are first used; persists across
+    // frames (below the static watermark)
+    void *heap = RingAlloc(SAMPLER_HEAP_SLOTS * 8, &m_samplerHeapOffset);
+    memset(heap, 0, SAMPLER_HEAP_SLOTS * 8);
     m_ringStaticEnd = m_ringOffset;
   }
 
@@ -1320,6 +1740,8 @@ HRESULT D9MTDevice::Init() {
 D9MTDevice::~D9MTDevice() {
   for (auto &e : m_psoCache)
     NSObject_release(e.second);
+  for (auto &s : m_samplers)
+    NSObject_release(s.handle);
   m_ring.free();
   if (m_vbuf)
     NSObject_release(m_vbuf);
@@ -1533,6 +1955,89 @@ obj_handle_t D9MTDevice::GetOrCreatePso() {
   return pp.ret_pso;
 }
 
+// D3DTADDRESS_* -> WMTSamplerAddressMode
+static WMTSamplerAddressMode d3d_address_to_wmt(DWORD mode) {
+  switch (mode) {
+  case D3DTADDRESS_WRAP:       return WMTSamplerAddressModeRepeat;
+  case D3DTADDRESS_MIRROR:     return WMTSamplerAddressModeMirrorRepeat;
+  case D3DTADDRESS_CLAMP:      return WMTSamplerAddressModeClampToEdge;
+  case D3DTADDRESS_BORDER:     return WMTSamplerAddressModeClampToBorderColor;
+  case D3DTADDRESS_MIRRORONCE: return WMTSamplerAddressModeMirrorClampToEdge;
+  default:                     return WMTSamplerAddressModeRepeat;
+  }
+}
+
+// MTLSamplerState for the slot's current D3D9 sampler states, deduped on
+// the packed state vector. Returns the heap index shaders use.
+uint32_t D9MTDevice::GetOrCreateSampler(UINT slot) {
+  const DWORD *ss = m_samplerStates[slot];
+  uint64_t key = (uint64_t)(ss[D3DSAMP_ADDRESSU] & 7) |
+                 (uint64_t)(ss[D3DSAMP_ADDRESSV] & 7) << 3 |
+                 (uint64_t)(ss[D3DSAMP_ADDRESSW] & 7) << 6 |
+                 (uint64_t)(ss[D3DSAMP_MAGFILTER] & 7) << 9 |
+                 (uint64_t)(ss[D3DSAMP_MINFILTER] & 7) << 12 |
+                 (uint64_t)(ss[D3DSAMP_MIPFILTER] & 7) << 15 |
+                 (uint64_t)(ss[D3DSAMP_MAXANISOTROPY] & 31) << 18 |
+                 (uint64_t)(ss[D3DSAMP_BORDERCOLOR] ? 1 : 0) << 23;
+  for (uint32_t i = 0; i < m_samplers.size(); i++)
+    if (m_samplers[i].key == key)
+      return i;
+  if (m_samplers.size() >= SAMPLER_HEAP_SLOTS) {
+    STUB_ONCE("sampler heap full");
+    return 0;
+  }
+
+  WMTSamplerInfo si = {};
+  si.min_filter = ss[D3DSAMP_MINFILTER] >= D3DTEXF_LINEAR
+                      ? WMTSamplerMinMagFilterLinear
+                      : WMTSamplerMinMagFilterNearest;
+  si.mag_filter = ss[D3DSAMP_MAGFILTER] >= D3DTEXF_LINEAR
+                      ? WMTSamplerMinMagFilterLinear
+                      : WMTSamplerMinMagFilterNearest;
+  si.mip_filter = ss[D3DSAMP_MIPFILTER] == D3DTEXF_NONE
+                      ? WMTSamplerMipFilterNotMipmapped
+                      : (ss[D3DSAMP_MIPFILTER] == D3DTEXF_POINT
+                             ? WMTSamplerMipFilterNearest
+                             : WMTSamplerMipFilterLinear);
+  si.s_address_mode = d3d_address_to_wmt(ss[D3DSAMP_ADDRESSU]);
+  si.t_address_mode = d3d_address_to_wmt(ss[D3DSAMP_ADDRESSV]);
+  si.r_address_mode = d3d_address_to_wmt(ss[D3DSAMP_ADDRESSW]);
+  si.border_color = (ss[D3DSAMP_BORDERCOLOR] >> 24)
+                        ? WMTSamplerBorderColorOpaqueBlack
+                        : WMTSamplerBorderColorTransparentBlack;
+  si.lod_min_clamp = 0.0f;
+  si.lod_max_clamp = 1000.0f;
+  si.max_anisotroy = ss[D3DSAMP_MINFILTER] == D3DTEXF_ANISOTROPIC
+                         ? (ss[D3DSAMP_MAXANISOTROPY] ? ss[D3DSAMP_MAXANISOTROPY] : 1)
+                         : 1;
+  si.normalized_coords = true;
+  si.support_argument_buffers = true;
+
+  obj_handle_t handle = MTLDevice_newSamplerState(m_mtlDevice, &si);
+  if (!handle) {
+    log_msg("GetOrCreateSampler: newSamplerState failed (key %llx)",
+            (unsigned long long)key);
+    return 0;
+  }
+  uint32_t idx = (uint32_t)m_samplers.size();
+  ((uint64_t *)((uint8_t *)m_ring.mem + m_samplerHeapOffset))[idx] =
+      si.gpu_resource_id;
+  m_samplers.push_back({key, handle});
+  return idx;
+}
+
+void D9MTDevice::MarkResident(obj_handle_t res) {
+  for (obj_handle_t r : m_frameResident)
+    if (r == res)
+      return;
+  auto *use = AppendCmd<wmtcmd_render_useresource>(WMTRenderCommandUseResource);
+  use->resource = res;
+  use->usage = WMTResourceUsageRead;
+  use->stages =
+      (WMTRenderStages)(WMTRenderStageVertex | WMTRenderStageFragment);
+  m_frameResident.push_back(res);
+}
+
 bool D9MTDevice::PrepareDraw() {
   if (!m_vs || !m_ps || !m_vdecl) {
     STUB_ONCE("draw without vs/ps/vertex declaration (FF draw path)");
@@ -1570,9 +2075,9 @@ bool D9MTDevice::PrepareDraw() {
   rs->point_size = 1.0f;
   rs->point_size_min = 1.0f;
   rs->point_size_max = 64.0f;
-  // sampler heap index == D3D9 sampler slot; two u16 indices per dword
-  for (uint32_t k = 0; k < 8; k++)
-    rs->sampler_idx[k] = ((2 * k + 1) << 16) | (2 * k);
+  // per-slot sampler heap indices, filled from the shaders' texture
+  // bindings below and packed two u16 per dword at the end
+  uint16_t samplerIdx[MAX_SAMPLERS] = {};
 
   for (int stage = 0; stage < 2; stage++) {
     const D9MTShaderData &sh = stage ? m_ps->m_data : m_vs->m_data;
@@ -1605,7 +2110,22 @@ bool D9MTDevice::PrepareDraw() {
         ab[si.idClipInfo] = m_ring.gpuAddr + m_clipInfoOffset;
       if (si.idSpecState >= 0)
         ab[si.idSpecState] = m_ring.gpuAddr + m_specStateOffset;
-      // textures stay 0 until SetTexture support lands
+      for (const auto &tb : si.textures) {
+        if (tb.shadow)
+          continue; // depth-compare variant: lands with depth textures
+        if (!stage) {
+          STUB_ONCE("vertex texture fetch");
+          continue;
+        }
+        D9MTTexture *tex =
+            tb.samplerSlot < MAX_SAMPLERS ? m_textures[tb.samplerSlot] : nullptr;
+        if (!tex)
+          continue; // slot empty: shader reads a null texture handle
+        ab[tb.abId] = tex->m_gpuId;
+        MarkResident(tex->SampleHandle());
+        samplerIdx[tb.samplerSlot] =
+            (uint16_t)GetOrCreateSampler(tb.samplerSlot);
+      }
 
       auto *sb = AppendCmd<wmtcmd_render_setbuffer>(
           stage ? WMTRenderCommandSetFragmentBuffer
@@ -1624,20 +2144,19 @@ bool D9MTDevice::PrepareDraw() {
       sb->index = (uint8_t)si.rsBufferIndex;
     }
 
-    if (stage && si.samplerHeapIndex >= 0) {
-      // no samplers yet: bind a zeroed heap so the shader has something
-      UINT heapOff = 0;
-      void *heap = RingAlloc(32 * 8, &heapOff);
-      if (!heap)
-        return false;
-      memset(heap, 0, 32 * 8);
+    if (si.samplerHeapIndex >= 0) {
       auto *sb = AppendCmd<wmtcmd_render_setbuffer>(
-          WMTRenderCommandSetFragmentBuffer);
+          stage ? WMTRenderCommandSetFragmentBuffer
+                : WMTRenderCommandSetVertexBuffer);
       sb->buffer = m_ring.buf;
-      sb->offset = heapOff;
+      sb->offset = m_samplerHeapOffset;
       sb->index = (uint8_t)si.samplerHeapIndex;
     }
   }
+
+  for (uint32_t k = 0; k < 8; k++)
+    rs->sampler_idx[k] =
+        ((uint32_t)samplerIdx[2 * k + 1] << 16) | samplerIdx[2 * k];
 
   // vertex streams
   for (UINT s = 0; s < MAX_STREAMS; s++) {
@@ -1807,6 +2326,7 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   m_cmdTail = nullptr;
   m_ringOffset = m_ringStaticEnd;
   m_ringResident = false;
+  m_frameResident.clear();
   m_lastPso = 0;
 
   static int presented = 0;

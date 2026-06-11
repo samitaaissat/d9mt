@@ -2,3 +2,4 @@ build/
 prebuilt/
 *.log
 .DS_Store
+*_out.txt

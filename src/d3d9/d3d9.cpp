@@ -235,6 +235,15 @@ static bool d3dfmt_to_wmt(D3DFORMAT fmt, D9MTFormatInfo *out) {
   case D3DFMT_D24X8:
   case D3DFMT_D24FS8:
     return plain(WMTPixelFormatDepth32Float_Stencil8, 5);
+  // vendor-hack FOURCCs (sampleable depth + dummy RT), used by GTA IV
+  case MAKEFOURCC('I', 'N', 'T', 'Z'):
+  case MAKEFOURCC('R', 'A', 'W', 'Z'):
+    return plain(WMTPixelFormatDepth32Float_Stencil8, 5);
+  case MAKEFOURCC('D', 'F', '1', '6'):
+  case MAKEFOURCC('D', 'F', '2', '4'):
+    return plain(WMTPixelFormatDepth32Float, 4);
+  case MAKEFOURCC('N', 'U', 'L', 'L'): // dummy color RT, never sampled
+    return plain(WMTPixelFormatRGBA8Unorm, 4);
   default:                   return false;
   }
 }
@@ -247,6 +256,10 @@ static bool d3dfmt_is_depth(D3DFORMAT fmt) {
   case D3DFMT_D24S8:
   case D3DFMT_D24X8:
   case D3DFMT_D24FS8:
+  case MAKEFOURCC('I', 'N', 'T', 'Z'):
+  case MAKEFOURCC('R', 'A', 'W', 'Z'):
+  case MAKEFOURCC('D', 'F', '1', '6'):
+  case MAKEFOURCC('D', 'F', '2', '4'):
     return true;
   default:
     return false;

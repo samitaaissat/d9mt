@@ -553,7 +553,8 @@ using D9MTPixelShader = D9MTShaderBase<IDirect3DPixelShader9>;
 class D9MTSurface;
 
 // defined after D9MTDevice: queues a GPU mip generation for this frame
-static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, obj_handle_t tex);
+class D9MTTexture;
+static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, D9MTTexture *tex);
 
 static UINT full_mip_chain(UINT w, UINT h) {
   UINT dim = w > h ? w : h, levels = 1;
@@ -725,7 +726,7 @@ public:
   }
   void STDMETHODCALLTYPE GenerateMipSubLevels() override {
     if (m_tex && m_mtlLevels > 1)
-      d9mt_queue_mipgen(m_device, m_tex);
+      d9mt_queue_mipgen(m_device, this);
   }
 
   // IDirect3DTexture9
@@ -771,8 +772,14 @@ public:
     data.set(m_staging.data() + m_levelOffset[Level]);
     MTLTexture_replaceRegion(m_tex, origin, size, Level, 0, data,
                              RowBytes(Level), 0);
-    if (m_autogen && Level == 0)
-      d9mt_queue_mipgen(m_device, m_tex);
+    if (Level < 32)
+      m_uploadedMask |= 1u << Level;
+    // autogen textures, and multi-level textures the app only ever fills
+    // at level 0, get a GPU-generated chain (checked again at Present in
+    // case real mips arrive later this frame)
+    if (Level == 0 && m_mtlLevels > 1 &&
+        (m_autogen || m_uploadedMask == 1u))
+      d9mt_queue_mipgen(m_device, this);
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE AddDirtyRect(const RECT *) override {
@@ -786,7 +793,13 @@ public:
   uint64_t m_srgbGpuId = 0;
   bool m_noUpload = false; // private storage: UnlockRect skips replaceRegion
   bool m_autogen = false;
-  UINT m_mtlLevels = 1; // Metal chain length (> m_levels for autogen)
+  UINT m_mtlLevels = 1;       // Metal chain length (>= m_levels)
+  uint32_t m_uploadedMask = 0; // which levels the app has written
+
+  // Present-time check: generate only if the app never supplied real mips
+  bool WantsGeneratedMips() const {
+    return m_mtlLevels > 1 && (m_autogen || m_uploadedMask == 1u);
+  }
 
 private:
   volatile LONG m_refcount = 1;
@@ -1144,7 +1157,7 @@ class D9MTInterface;
 
 class D9MTDevice final : public IDirect3DDevice9Ex {
   friend class D9MTInterface; // CreateDevice seeds m_pp
-  friend void d9mt_queue_mipgen(IDirect3DDevice9 *, obj_handle_t);
+  friend void d9mt_queue_mipgen(IDirect3DDevice9 *, D9MTTexture *);
 public:
   D9MTDevice(D9MTInterface *parent, HWND hwnd, UINT width, UINT height)
       : m_parent(parent), m_hwnd(hwnd), m_width(width), m_height(height) {
@@ -2338,9 +2351,9 @@ private:
 
   // textures needing GPU mip generation this frame (autogen /
   // GenerateMipSubLevels); blitted at the head of the Present cmdbuf
-  std::vector<obj_handle_t> m_pendingMipGen;
-  void QueueMipGen(obj_handle_t tex) {
-    for (obj_handle_t t : m_pendingMipGen)
+  std::vector<D9MTTexture *> m_pendingMipGen;
+  void QueueMipGen(D9MTTexture *tex) {
+    for (D9MTTexture *t : m_pendingMipGen)
       if (t == tex)
         return;
     m_pendingMipGen.push_back(tex);
@@ -2968,7 +2981,7 @@ uint32_t D9MTDevice::GetOrCreateSampler(const DWORD *ss) {
   return idx;
 }
 
-static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, obj_handle_t tex) {
+static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, D9MTTexture *tex) {
   static_cast<D9MTDevice *>(dev)->QueueMipGen(tex);
 }
 
@@ -3513,19 +3526,26 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   // GPU mip generation for textures uploaded this frame, ahead of every
   // pass that samples them
   if (!m_pendingMipGen.empty()) {
-    std::vector<wmtcmd_blit_generate_mipmaps> gens(m_pendingMipGen.size());
-    for (size_t i = 0; i < gens.size(); i++) {
-      memset(&gens[i], 0, sizeof(gens[i]));
-      gens[i].type = WMTBlitCommandGenerateMipmaps;
-      gens[i].texture = m_pendingMipGen[i];
-      if (i + 1 < gens.size())
-        gens[i].next.set(&gens[i + 1]);
+    std::vector<wmtcmd_blit_generate_mipmaps> gens;
+    gens.reserve(m_pendingMipGen.size());
+    for (D9MTTexture *t : m_pendingMipGen) {
+      if (!t->WantsGeneratedMips()) // real mips arrived after queueing
+        continue;
+      wmtcmd_blit_generate_mipmaps g;
+      memset(&g, 0, sizeof(g));
+      g.type = WMTBlitCommandGenerateMipmaps;
+      g.texture = t->m_tex;
+      gens.push_back(g);
     }
-    obj_handle_t benc = MTLCommandBuffer_blitCommandEncoder(cmdbuf);
-    if (benc) {
-      MTLBlitCommandEncoder_encodeCommands(
-          benc, (const wmtcmd_base *)gens.data());
-      MTLCommandEncoder_endEncoding(benc);
+    for (size_t i = 0; i + 1 < gens.size(); i++)
+      gens[i].next.set(&gens[i + 1]);
+    if (!gens.empty()) {
+      obj_handle_t benc = MTLCommandBuffer_blitCommandEncoder(cmdbuf);
+      if (benc) {
+        MTLBlitCommandEncoder_encodeCommands(
+            benc, (const wmtcmd_base *)gens.data());
+        MTLCommandEncoder_endEncoding(benc);
+      }
     }
     m_pendingMipGen.clear();
   }

@@ -1,5 +1,12 @@
 #pragma once
 
+// d9mt: local extension over v2.7.1 — adds dummy image/buffer view descriptors
+// (imageViewDescriptor/bufferViewDescriptor, m_image1D/2D/3D, view arrays,
+// createImage/createImages/createBufferViews) as fallback resources for unbound
+// bindings on devices without the nullDescriptor feature (Metal backend).
+// Conceptually backports the pre-2022 upstream dummy-resource feature; not a
+// copy of any upstream version. Re-apply after any re-vendor.
+
 #include <array>
 #include <mutex>
 

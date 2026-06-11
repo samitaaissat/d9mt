@@ -1,0 +1,100 @@
+DXVK vendored snapshot
+======================
+
+Tag:         v2.7.1
+SHA:         c3dd74be6baec53786d4e064a572185b70347a17
+Date synced: 2026-06-11
+
+src/dxso verified byte-for-byte identical to upstream v2.7.1 (no local
+patches in dxso). Note: upstream removed the dxso module after this tag
+(aeb0f217 "[d3d9] Remove DXSO module"; predecessor 0d72ff05 "[d3d9]
+Always use dxbc-spirv"), so v2.7.1 is the last coherent snapshot where
+the d3d9 front-end drives dxso.
+
+Intentional local patches (re-apply after any re-vendor; each marked
+with a "// d9mt" comment in the file):
+
+1. src/util/util_env.cpp
+   #ifdef __APPLE__ uses the single-argument macOS
+   pthread_setname_np(name) (applies to calling thread) instead of
+   pthread_setname_np(pthread_self(), name). macOS port fix.
+
+2. src/util/util_small_vector.h
+   In pick_capacity, casts (n - 1) to uint64_t before bit::lzcnt
+   because size_t is unsigned long on macOS and is ambiguous between
+   the uint32_t/uint64_t lzcnt overloads. macOS compile fix.
+
+3. src/dxvk/dxvk_unbound.h
+   Local d9mt extension (matches no upstream ref): adds dummy
+   imageViewDescriptor(VkImageViewType, bool storage) and
+   bufferViewDescriptor(bool storage) returning const DxvkDescriptor*,
+   plus m_image1D/2D/3D, an array of 2*(VK_IMAGE_VIEW_TYPE_CUBE_ARRAY+1)
+   image views, sampled/storage buffer views, and
+   createImage/createImages/createBufferViews helpers — fallback dummy
+   resources for unbound bindings on devices without the nullDescriptor
+   feature (the Metal backend). Written against v2.7.1's DxvkDescriptor
+   API; conceptually backports the pre-2022 upstream dummy-resource
+   feature (removed upstream in 6f5ae58c) but is not a copy of any
+   upstream version. A matching dxvk_unbound.cpp implementation will be
+   needed.
+
+4. src/dxvk/dxvk_dummy_frag.h
+   Local addition, not in any tag's tree: pre-generated SPIR-V
+   uint32_t array for upstream's src/dxvk/shaders/dxvk_dummy_frag.frag
+   (upstream compiles it with glslang at build time). Checked in so the
+   mingw build does not need glslang. Keep as-is.
+
+Vendored-file manifest (2026-06-11 full d3d9 front-end vendor, v2.7.1
+c3dd74be; copied verbatim from /tmp/dxvk-src, then the 4 d9mt patches
+above re-applied). Counts are files present per directory after sync:
+
+  src/d3d9                 44 h + 36 cpp   (full front-end, verbatim)
+  src/d3d9/shaders          1 h +  7 comp  (conversion shader sources)
+  src/dxbc                 17 h            (headers only, no TUs)
+  src/dxso                 16 h + 13 cpp   (untouched this sync; verified
+                                            v2.7.1 previously)
+  src/dxvk                 66 h +  3 cpp   (65 upstream h + dxvk_dummy_frag.h
+                                            local; dxvk_unbound.h = upstream
+                                            + d9mt extension preserved; cpps =
+                                            dxvk_shader.cpp, dxvk_shader_key.cpp,
+                                            dxvk_pipelayout.cpp — pure utility
+                                            TUs needed by dxso, byte-identical
+                                            to v2.7.1; NO Vulkan-backend TUs)
+  src/dxvk/hud              4 h
+  src/spirv                 5 h +  3 cpp
+  src/util                 26 h + 10 cpp   (top level; util_env.cpp +
+                                            util_small_vector.h carry d9mt
+                                            patches)
+  src/util/com              6 h +  3 cpp   (com_destruction_notifier.cpp
+                                            vendored but NOT in compile list)
+  src/util/config           1 h +  1 cpp
+  src/util/log              2 h +  2 cpp
+  src/util/rc               2 h
+  src/util/sha1             2 h +  1 c + 1 cpp (sha1.c is plain C)
+  src/util/sync             5 h +  1 cpp
+  src/vulkan                3 h +  2 cpp
+  src/wsi                   4 h +  2 cpp   (+ glfw/sdl2/sdl3 mirrored,
+                                            win32 1 h + 3 cpp is the
+                                            compiled platform)
+  src/wsi/glfw|sdl2|sdl3    2 h +  3 cpp each (not compiled)
+  src/wsi/win32             1 h +  3 cpp
+  include/native           77 h            (directx 62 / windows 11 / wsi 4;
+                                            directx is an uninitialized
+                                            submodule upstream — kept prior
+                                            vendored copy)
+  include/vulkan           30 h            (Vulkan-Headers; submodule empty
+                                            upstream — kept prior copy)
+  include/spirv            27 h            (SPIRV-Headers; submodule empty
+                                            upstream — kept prior copy)
+  generated/                7 h            (d3d9_convert_*.h SPIR-V arrays
+                                            pre-generated with glslang
+                                            --target-env vulkan1.3 --vn from
+                                            src/d3d9/shaders/*.comp; needed
+                                            by d3d9_format_helpers.cpp; add
+                                            -Ivendor/dxvk/generated)
+
+Include-closure check: every quoted (repo-relative) #include reachable
+from the 36 src/d3d9 cpps resolves inside this tree (212 files in the
+transitive closure). Remaining build-time-generated deps if dxvk_instance
+/hud_item TUs are ever added: version.h, buildenv.h (see
+docs/BACKEND-SURFACE.md 6.3).

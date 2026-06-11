@@ -3,9 +3,11 @@
 
 #include "com_guid.h"
 
-#include "../../d3d11/d3d11_interfaces.h"
-
-#include "../../dxgi/dxgi_interfaces.h"
+// d9mt: d3d11/dxgi interface headers are not vendored and nothing in this
+// TU uses them (mingw resolves IIDs via __CRT_UUID_DECL templates).
+//#include "../../d3d11/d3d11_interfaces.h"
+//#include "../../dxgi/dxgi_interfaces.h"
+#include "../log/log.h" // d9mt: Logger came in transitively via the above
 
 #include "../../dxvk/dxvk_hash.h"
 

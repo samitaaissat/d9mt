@@ -1,5 +1,8 @@
 	// 1116.2.0
 	 #pragma once
+// d9mt: local addition, not in any upstream tag's tree. Pre-generated SPIR-V
+// for upstream src/dxvk/shaders/dxvk_dummy_frag.frag (upstream compiles it with
+// glslang at build time); checked in so the mingw build does not need glslang.
 const uint32_t dxvk_dummy_frag[] = {
 	0x07230203,0x00010600,0x0008000b,0x00000006,0x00000000,0x00020011,0x00000001,0x0006000b,
 	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,

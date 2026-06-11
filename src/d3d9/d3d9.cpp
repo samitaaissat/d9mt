@@ -1205,7 +1205,7 @@ public:
       props.drawable_height = h;
       props.opaque = true;
       props.display_sync_enabled = true;
-      props.framebuffer_only = true;
+      props.framebuffer_only = false; // drawable is a blit target
       props.pixel_format = WMTPixelFormatBGRA8Unorm;
       MetalLayer_setProps(m_layer, &props);
       // default depth + size cache are stale
@@ -1228,6 +1228,7 @@ public:
       dti.usage = WMTTextureUsageRenderTarget;
       dti.options = WMTResourceStorageModePrivate;
       m_depthTex = MTLDevice_newTexture(m_mtlDevice, &dti);
+      CreateBackbufferProxy();
       // stale backbuffer desc: recreate on next Get
       if (m_backBuffer) {
         m_backBuffer->Release();
@@ -1238,10 +1239,14 @@ public:
         m_autoDepth = nullptr;
       }
     }
-    // make the window visible and sized to the swapchain in windowed mode
-    if (pp->Windowed)
+    // position the window once per size (re-positioning on the Reset the
+    // game issues in response to WM_SIZE would loop)
+    if (pp->Windowed && (w != m_lastPosW || h != m_lastPosH)) {
+      m_lastPosW = w;
+      m_lastPosH = h;
       SetWindowPos(m_hwnd, HWND_TOP, 40, 40, w, h,
                    SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    }
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE Present(const RECT *pSourceRect,
@@ -1443,7 +1448,25 @@ public:
                                         IDirect3DSurface9 *pDestSurface,
                                         const RECT *pDestRect,
                                         D3DTEXTUREFILTERTYPE Filter) override {
-    STUB_ONCE("StretchRect");
+    obj_handle_t src, dst;
+    uint32_t sl, dl;
+    UINT sw, sh, dw, dh;
+    if (!ResolveSurfaceTex(pSourceSurface, &src, &sl, &sw, &sh) ||
+        !ResolveSurfaceTex(pDestSurface, &dst, &dl, &dw, &dh))
+      return D3DERR_INVALIDCALL;
+    if (sw != dw || sh != dh)
+      STUB_ONCE("StretchRect: scaling copy degraded to min-size blit");
+    // copy slots into the pass stream in submission order
+    ClosePass();
+    PassRec blit = {};
+    blit.isBlit = true;
+    blit.blitSrc = src;
+    blit.blitDst = dst;
+    blit.blitSrcLevel = sl;
+    blit.blitDstLevel = dl;
+    blit.blitW = sw < dw ? sw : dw;
+    blit.blitH = sh < dh ? sh : dh;
+    m_passes.push_back(blit);
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE ColorFill(IDirect3DSurface9 *pSurface,
@@ -2181,7 +2204,8 @@ private:
   // current pass; Present encodes them in order, last ones onto the
   // drawable. colorTex==0 means the swapchain drawable.
   struct PassRec {
-    obj_handle_t colorTex = 0;
+    bool isBlit = false;
+    obj_handle_t colorTex = 0; // 0 = backbuffer proxy texture
     uint16_t colorLevel = 0;
     uint32_t colorFmt = WMTPixelFormatBGRA8Unorm;
     obj_handle_t depthTex = 0; // 0 = device default (or size-matched cache)
@@ -2193,6 +2217,10 @@ private:
     bool clearStencil = false;
     DWORD clearStencilVal = 0;
     wmtcmd_base *head = nullptr;
+    // blit fields (isBlit): texture-to-texture copy, no scaling
+    obj_handle_t blitSrc = 0, blitDst = 0;
+    uint32_t blitSrcLevel = 0, blitDstLevel = 0;
+    UINT blitW = 0, blitH = 0;
   };
   std::vector<PassRec> m_passes;
   PassRec m_curPass;
@@ -2252,7 +2280,11 @@ private:
 
   // --- render states, depth, viewport/scissor ---
   DWORD m_renderStates[MAX_RENDER_STATES] = {};
-  obj_handle_t m_depthTex = 0; // Depth32Float, backbuffer-sized, private
+  obj_handle_t m_depthTex = 0; // depth+stencil, backbuffer-sized, private
+  // backbuffer proxy: passes render here; Present blits it to the
+  // drawable. Lets StretchRect read the "backbuffer" mid-frame.
+  obj_handle_t m_bbTex = 0;
+  UINT m_lastPosW = 0, m_lastPosH = 0; // Reset window-positioning guard
   float m_clearDepth = 1.0f;
   D3DVIEWPORT9 m_viewport = {};
   bool m_viewportSet = false;
@@ -2304,6 +2336,9 @@ private:
   void OpenPass();
   void ClosePass();
   obj_handle_t GetDepthForSize(UINT w, UINT h);
+  bool CreateBackbufferProxy();
+  bool ResolveSurfaceTex(IDirect3DSurface9 *surf, obj_handle_t *tex,
+                         uint32_t *level, UINT *w, UINT *h);
 };
 
 HRESULT D9MTDevice::Init() {
@@ -2350,7 +2385,7 @@ HRESULT D9MTDevice::Init() {
   props.drawable_height = m_height;
   props.opaque = true;
   props.display_sync_enabled = true;
-  props.framebuffer_only = true;
+  props.framebuffer_only = false; // drawable is a blit target
   props.pixel_format = WMTPixelFormatBGRA8Unorm;
   MetalLayer_setProps(m_layer, &props);
 
@@ -2438,6 +2473,11 @@ HRESULT D9MTDevice::Init() {
       return D3DERR_NOTAVAILABLE;
     }
   }
+  if (!CreateBackbufferProxy()) {
+    log_msg("Init: backbuffer proxy creation failed");
+    NSObject_release(pool);
+    return D3DERR_NOTAVAILABLE;
+  }
 
   // upload ring for the programmable path (cbuffers, argument buffers,
   // render_state), plus static blocks the generated shaders always expect
@@ -2485,6 +2525,8 @@ D9MTDevice::~D9MTDevice() {
     m_autoDepth->Release();
   if (m_depthTex)
     NSObject_release(m_depthTex);
+  if (m_bbTex)
+    NSObject_release(m_bbTex);
   for (auto &e : m_depthCache)
     NSObject_release(e.tex);
   m_ring.free();
@@ -2796,6 +2838,48 @@ uint32_t D9MTDevice::GetOrCreateSampler(UINT slot) {
       si.gpu_resource_id;
   m_samplers.push_back({key, handle});
   return idx;
+}
+
+bool D9MTDevice::CreateBackbufferProxy() {
+  if (m_bbTex)
+    NSObject_release(m_bbTex);
+  WMTTextureInfo ti = {};
+  ti.pixel_format = WMTPixelFormatBGRA8Unorm;
+  ti.width = m_width;
+  ti.height = m_height;
+  ti.depth = 1;
+  ti.array_length = 1;
+  ti.type = WMTTextureType2D;
+  ti.mipmap_level_count = 1;
+  ti.sample_count = 1;
+  ti.usage =
+      (WMTTextureUsage)(WMTTextureUsageRenderTarget | WMTTextureUsageShaderRead);
+  ti.options = WMTResourceStorageModePrivate;
+  m_bbTex = MTLDevice_newTexture(m_mtlDevice, &ti);
+  return m_bbTex != 0;
+}
+
+// surface -> Metal texture for blits: backbuffer/placeholder surfaces map
+// to the proxy, texture surfaces to their parent's texture+level
+bool D9MTDevice::ResolveSurfaceTex(IDirect3DSurface9 *surf, obj_handle_t *tex,
+                                   uint32_t *level, UINT *w, UINT *h) {
+  if (!surf)
+    return false;
+  D9MTSurface *ts = nullptr;
+  surf->QueryInterface(IID_D9MTTexSurface, (void **)&ts);
+  if (ts) {
+    *tex = ts->Parent()->m_tex;
+    *level = ts->Level();
+    *w = ts->Parent()->LevelWidth(ts->Level());
+    *h = ts->Parent()->LevelHeight(ts->Level());
+    return true;
+  }
+  // plain surface: treat as the backbuffer proxy
+  *tex = m_bbTex;
+  *level = 0;
+  *w = m_width;
+  *h = m_height;
+  return true;
 }
 
 // depth texture matching arbitrary RT dims (default depth only fits the
@@ -3210,11 +3294,29 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   obj_handle_t drawTex = MetalDrawable_texture(drawable);
   obj_handle_t cmdbuf = MTLCommandQueue_commandBuffer(m_queue);
 
-  bool drawableTouched = false;
+  bool bbTouched = false;
   auto encodePass = [&](const PassRec &p, const wmtcmd_base *head) {
+    if (p.isBlit) {
+      struct wmtcmd_blit_copy_from_texture_to_texture cp = {};
+      cp.type = WMTBlitCommandCopyFromTextureToTexture;
+      cp.src = p.blitSrc;
+      cp.src_level = p.blitSrcLevel;
+      cp.src_size = {p.blitW, p.blitH, 1};
+      cp.dst = p.blitDst;
+      cp.dst_level = p.blitDstLevel;
+      obj_handle_t benc = MTLCommandBuffer_blitCommandEncoder(cmdbuf);
+      if (benc) {
+        MTLBlitCommandEncoder_encodeCommands(benc,
+                                             (const wmtcmd_base *)&cp);
+        MTLCommandEncoder_endEncoding(benc);
+      }
+      if (p.blitDst == m_bbTex)
+        bbTouched = true;
+      return;
+    }
     WMTRenderPassInfo pass = {};
-    bool toDrawable = p.colorTex == 0;
-    pass.colors[0].texture = toDrawable ? drawTex : p.colorTex;
+    bool toBB = p.colorTex == 0; // "backbuffer" = the proxy texture
+    pass.colors[0].texture = toBB ? m_bbTex : p.colorTex;
     pass.colors[0].level = p.colorLevel;
     pass.colors[0].store_action = WMTStoreActionStore;
     if (p.clearColor) {
@@ -3224,10 +3326,8 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
       pass.colors[0].clear_color.b = (p.clearColorVal & 0xff) / 255.0;
       pass.colors[0].clear_color.a = ((p.clearColorVal >> 24) & 0xff) / 255.0;
     } else {
-      // preserve earlier passes on the same attachment within the frame
-      pass.colors[0].load_action = (toDrawable && !drawableTouched)
-                                       ? WMTLoadActionDontCare
-                                       : WMTLoadActionLoad;
+      // proxy contents persist across frames; always preserve
+      pass.colors[0].load_action = WMTLoadActionLoad;
     }
     obj_handle_t depth =
         p.depthTex ? p.depthTex : GetDepthForSize(p.width, p.height);
@@ -3246,14 +3346,14 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
     obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(cmdbuf, &pass);
     if (!enc) {
       log_msg("Present: renderCommandEncoder failed (pass %s %ux%u)",
-              toDrawable ? "drawable" : "texture", p.width, p.height);
+              toBB ? "backbuffer" : "texture", p.width, p.height);
       return;
     }
     if (head)
       MTLRenderCommandEncoder_encodeCommands(enc, head);
     MTLCommandEncoder_endEncoding(enc);
-    if (toDrawable)
-      drawableTouched = true;
+    if (toBB)
+      bbTouched = true;
   };
 
   for (const PassRec &p : m_passes)
@@ -3289,17 +3389,31 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
     encodePass(ff, (const wmtcmd_base *)&setPso);
   }
 
-  // clear-only frame (or trailing clear): give the drawable its clear
-  if (!drawableTouched) {
+  // clear-only frame (or trailing clear): give the proxy its clear
+  if (!bbTouched && (m_clearPending || m_pendClearColor)) {
     PassRec co = {};
     co.width = m_width;
     co.height = m_height;
-    co.clearColor = m_clearPending || m_pendClearColor;
+    co.clearColor = true;
     co.clearColorVal = m_clearColor;
     co.clearDepth = true;
     co.clearDepthVal = m_clearDepth;
     encodePass(co, nullptr);
     m_pendClearColor = m_pendClearDepth = m_pendClearStencil = false;
+  }
+
+  // proxy -> drawable
+  {
+    struct wmtcmd_blit_copy_from_texture_to_texture cp = {};
+    cp.type = WMTBlitCommandCopyFromTextureToTexture;
+    cp.src = m_bbTex;
+    cp.src_size = {m_width, m_height, 1};
+    cp.dst = drawTex;
+    obj_handle_t benc = MTLCommandBuffer_blitCommandEncoder(cmdbuf);
+    if (benc) {
+      MTLBlitCommandEncoder_encodeCommands(benc, (const wmtcmd_base *)&cp);
+      MTLCommandEncoder_endEncoding(benc);
+    }
   }
 
   MTLCommandBuffer_presentDrawable(cmdbuf, drawable);

@@ -79,6 +79,7 @@ static constexpr UINT RING_SIZE = 8u << 20; // per-frame upload ring
 static constexpr UINT MAX_SAMPLERS = 16;    // PS samplers s0-s15
 static constexpr UINT MAX_SAMPLER_STATES = 14; // D3DSAMP_* max + 1
 static constexpr UINT SAMPLER_HEAP_SLOTS = 64; // distinct sampler states
+static constexpr UINT MAX_RENDER_STATES = 256; // D3DRS_* fit comfortably
 
 // matches the render_state_t push block spirv-cross emits for the DXVK
 // dxso shaders (see build/test_*.metal); sampler words pack two u16 heap
@@ -99,6 +100,46 @@ struct D9MTRenderStateBlock {
   uint32_t sampler_idx[8];
 };
 static_assert(sizeof(D9MTRenderStateBlock) == 96, "render_state layout");
+
+// D3DBLEND -> MTLBlendFactor raw value
+static uint32_t d3dblend_to_mtl(DWORD b) {
+  switch (b) {
+  case D3DBLEND_ZERO:           return 0;  // Zero
+  case D3DBLEND_ONE:            return 1;  // One
+  case D3DBLEND_SRCCOLOR:       return 2;  // SourceColor
+  case D3DBLEND_INVSRCCOLOR:    return 3;
+  case D3DBLEND_SRCALPHA:       return 4;  // SourceAlpha
+  case D3DBLEND_INVSRCALPHA:    return 5;
+  case D3DBLEND_DESTCOLOR:      return 6;  // DestinationColor
+  case D3DBLEND_INVDESTCOLOR:   return 7;
+  case D3DBLEND_DESTALPHA:      return 8;  // DestinationAlpha
+  case D3DBLEND_INVDESTALPHA:   return 9;
+  case D3DBLEND_SRCALPHASAT:    return 10; // SourceAlphaSaturated
+  case D3DBLEND_BLENDFACTOR:    return 11; // BlendColor
+  case D3DBLEND_INVBLENDFACTOR: return 12;
+  default:                      return 1;
+  }
+}
+
+// D3DBLENDOP -> MTLBlendOperation (Add/Sub/RevSub/Min/Max, off by one)
+static uint32_t d3dblendop_to_mtl(DWORD op) {
+  return (op >= D3DBLENDOP_ADD && op <= D3DBLENDOP_MAX) ? op - 1 : 0;
+}
+
+// D3DCMPFUNC -> WMTCompareFunction (same order, off by one)
+static WMTCompareFunction d3dcmp_to_wmt(DWORD f) {
+  return (f >= D3DCMP_NEVER && f <= D3DCMP_ALWAYS)
+             ? (WMTCompareFunction)(f - 1)
+             : WMTCompareFunctionAlways;
+}
+
+// D3DCOLORWRITEENABLE (R=1,G=2,B=4,A=8) -> MTLColorWriteMask (A=1,B=2,G=4,R=8)
+static uint32_t d3dwritemask_to_mtl(DWORD m) {
+  return ((m & D3DCOLORWRITEENABLE_RED) ? 8u : 0) |
+         ((m & D3DCOLORWRITEENABLE_GREEN) ? 4u : 0) |
+         ((m & D3DCOLORWRITEENABLE_BLUE) ? 2u : 0) |
+         ((m & D3DCOLORWRITEENABLE_ALPHA) ? 1u : 0);
+}
 
 // D3DDECLTYPE -> MTLVertexFormat raw value (0 = unsupported)
 static uint32_t decltype_to_mtl(BYTE type) {
@@ -754,6 +795,14 @@ public:
       m_samplerStates[s][D3DSAMP_MIPFILTER] = D3DTEXF_NONE;
       m_samplerStates[s][D3DSAMP_MAXANISOTROPY] = 1;
     }
+    m_renderStates[D3DRS_ZENABLE] = D3DZB_TRUE;
+    m_renderStates[D3DRS_ZWRITEENABLE] = TRUE;
+    m_renderStates[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
+    m_renderStates[D3DRS_CULLMODE] = D3DCULL_CCW;
+    m_renderStates[D3DRS_SRCBLEND] = D3DBLEND_ONE;
+    m_renderStates[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
+    m_renderStates[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
+    m_renderStates[D3DRS_COLORWRITEENABLE] = 0xF;
   }
 
   HRESULT Init();
@@ -1022,6 +1071,8 @@ public:
       m_clearColor = Color;
       m_clearPending = true;
     }
+    if (Flags & D3DCLEAR_ZBUFFER)
+      m_clearDepth = Z; // the pass always clears depth (single pass/frame)
     return D3D_OK;
   }
 
@@ -1040,11 +1091,19 @@ public:
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE SetViewport(const D3DVIEWPORT9 *pViewport) override {
+    if (!pViewport)
+      return D3DERR_INVALIDCALL;
+    m_viewport = *pViewport;
+    m_viewportSet = true;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE GetViewport(D3DVIEWPORT9 *pViewport) override {
     if (!pViewport)
       return D3DERR_INVALIDCALL;
+    if (m_viewportSet) {
+      *pViewport = m_viewport;
+      return D3D_OK;
+    }
     pViewport->X = 0;
     pViewport->Y = 0;
     pViewport->Width = m_width;
@@ -1084,12 +1143,15 @@ public:
   }
   HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE State,
                                            DWORD Value) override {
+    if ((DWORD)State < MAX_RENDER_STATES)
+      m_renderStates[State] = Value;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE State,
                                            DWORD *pValue) override {
-    if (pValue)
-      *pValue = 0;
+    if (!pValue)
+      return D3DERR_INVALIDCALL;
+    *pValue = (DWORD)State < MAX_RENDER_STATES ? m_renderStates[State] : 0;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE
@@ -1187,15 +1249,23 @@ public:
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE SetScissorRect(const RECT *pRect) override {
+    if (!pRect)
+      return D3DERR_INVALIDCALL;
+    m_scissor = *pRect;
+    m_scissorSet = true;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE GetScissorRect(RECT *pRect) override {
-    if (pRect) {
-      pRect->left = 0;
-      pRect->top = 0;
-      pRect->right = (LONG)m_width;
-      pRect->bottom = (LONG)m_height;
+    if (!pRect)
+      return D3DERR_INVALIDCALL;
+    if (m_scissorSet) {
+      *pRect = m_scissor;
+      return D3D_OK;
     }
+    pRect->left = 0;
+    pRect->top = 0;
+    pRect->right = (LONG)m_width;
+    pRect->bottom = (LONG)m_height;
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE
@@ -1542,6 +1612,7 @@ private:
     void *vs;
     void *ps;
     void *decl;
+    uint32_t blend; // packed blend + color-write state
   };
   std::vector<std::pair<PsoKey, obj_handle_t>> m_psoCache;
 
@@ -1562,6 +1633,25 @@ private:
   // textures made resident this frame (their MTLTextures live outside the
   // ring, so each needs its own UseResource)
   std::vector<obj_handle_t> m_frameResident;
+
+  // --- render states, depth, viewport/scissor ---
+  DWORD m_renderStates[MAX_RENDER_STATES] = {};
+  obj_handle_t m_depthTex = 0; // Depth32Float, backbuffer-sized, private
+  float m_clearDepth = 1.0f;
+  D3DVIEWPORT9 m_viewport = {};
+  bool m_viewportSet = false;
+  RECT m_scissor = {};
+  bool m_scissorSet = false;
+
+  // depth-stencil state objects, deduped on (zenable, zwrite, zfunc)
+  struct DssoEntry {
+    uint32_t key;
+    obj_handle_t handle;
+  };
+  std::vector<DssoEntry> m_dssoCache;
+  obj_handle_t m_lastDsso = 0;       // dedupe SetDSSO per frame
+  uint32_t m_lastRaster = ~0u;       // dedupe rasterizer state per frame
+  uint64_t m_lastViewScissor = ~0ull; // dedupe viewport+scissor per frame
 
   template <typename T> T *AppendCmd(uint16_t type) {
     m_cmds.emplace_back();
@@ -1591,6 +1681,7 @@ private:
 
   HRESULT CompileShader(const DWORD *pFunction, D9MTShaderData &data);
   obj_handle_t GetOrCreatePso();
+  obj_handle_t GetOrCreateDsso();
   uint32_t GetOrCreateSampler(UINT slot);
   void MarkResident(obj_handle_t res);
   bool PrepareDraw();
@@ -1671,7 +1762,9 @@ HRESULT D9MTDevice::Init() {
   psoInfo.colors[0].blending_enabled = false;
   psoInfo.rasterization_enabled = true;
   psoInfo.raster_sample_count = 1;
-  psoInfo.depth_pixel_format = WMTPixelFormatInvalid;
+  // the frame pass always attaches the depth buffer, so every PSO
+  // (fixed-function included) must declare its format
+  psoInfo.depth_pixel_format = WMTPixelFormatDepth32Float;
   psoInfo.stencil_pixel_format = WMTPixelFormatInvalid;
   psoInfo.vertex_function = vs;
   psoInfo.fragment_function = ps;
@@ -1704,6 +1797,27 @@ HRESULT D9MTDevice::Init() {
     log_msg("Init: newBuffer failed");
     NSObject_release(pool);
     return D3DERR_NOTAVAILABLE;
+  }
+
+  // backbuffer-sized depth buffer, attached to every frame's render pass
+  {
+    WMTTextureInfo dti = {};
+    dti.pixel_format = WMTPixelFormatDepth32Float;
+    dti.width = m_width;
+    dti.height = m_height;
+    dti.depth = 1;
+    dti.array_length = 1;
+    dti.type = WMTTextureType2D;
+    dti.mipmap_level_count = 1;
+    dti.sample_count = 1;
+    dti.usage = WMTTextureUsageRenderTarget;
+    dti.options = WMTResourceStorageModePrivate;
+    m_depthTex = MTLDevice_newTexture(m_mtlDevice, &dti);
+    if (!m_depthTex) {
+      log_msg("Init: depth texture creation failed");
+      NSObject_release(pool);
+      return D3DERR_NOTAVAILABLE;
+    }
   }
 
   // upload ring for the programmable path (cbuffers, argument buffers,
@@ -1742,6 +1856,10 @@ D9MTDevice::~D9MTDevice() {
     NSObject_release(e.second);
   for (auto &s : m_samplers)
     NSObject_release(s.handle);
+  for (auto &d : m_dssoCache)
+    NSObject_release(d.handle);
+  if (m_depthTex)
+    NSObject_release(m_depthTex);
   m_ring.free();
   if (m_vbuf)
     NSObject_release(m_vbuf);
@@ -1875,10 +1993,18 @@ HRESULT D9MTDevice::CompileShader(const DWORD *pFunction,
 }
 
 obj_handle_t D9MTDevice::GetOrCreatePso() {
-  PsoKey key{m_vs, m_ps, m_vdecl};
+  // blend state lives in the Metal PSO, so it is part of the cache key
+  bool blendOn = m_renderStates[D3DRS_ALPHABLENDENABLE] != 0;
+  uint32_t blendKey =
+      (blendOn ? 1u : 0) | (m_renderStates[D3DRS_SRCBLEND] & 31) << 1 |
+      (m_renderStates[D3DRS_DESTBLEND] & 31) << 6 |
+      (m_renderStates[D3DRS_BLENDOP] & 7) << 11 |
+      (m_renderStates[D3DRS_COLORWRITEENABLE] & 0xF) << 14;
+
+  PsoKey key{m_vs, m_ps, m_vdecl, blendKey};
   for (auto &e : m_psoCache)
     if (e.first.vs == key.vs && e.first.ps == key.ps &&
-        e.first.decl == key.decl)
+        e.first.decl == key.decl && e.first.blend == key.blend)
       return e.second;
 
   struct d9mt_pso_info info;
@@ -1886,7 +2012,23 @@ obj_handle_t D9MTDevice::GetOrCreatePso() {
   info.vertex_function = m_vs->m_data.function;
   info.fragment_function = m_ps->m_data.function;
   info.colors[0].pixel_format = WMTPixelFormatBGRA8Unorm;
-  info.colors[0].write_mask = 0xF; // MTLColorWriteMaskAll
+  info.colors[0].write_mask =
+      d3dwritemask_to_mtl(m_renderStates[D3DRS_COLORWRITEENABLE]);
+  info.colors[0].blending_enabled = blendOn;
+  if (blendOn) {
+    uint32_t src = d3dblend_to_mtl(m_renderStates[D3DRS_SRCBLEND]);
+    uint32_t dst = d3dblend_to_mtl(m_renderStates[D3DRS_DESTBLEND]);
+    uint32_t op = d3dblendop_to_mtl(m_renderStates[D3DRS_BLENDOP]);
+    info.colors[0].src_rgb_blend_factor = src;
+    info.colors[0].dst_rgb_blend_factor = dst;
+    info.colors[0].rgb_blend_op = op;
+    // separate alpha blend (D3DRS_SEPARATEALPHABLENDENABLE) comes later;
+    // alpha follows the color factors like D3D9 without it
+    info.colors[0].src_alpha_blend_factor = src;
+    info.colors[0].dst_alpha_blend_factor = dst;
+    info.colors[0].alpha_blend_op = op;
+  }
+  info.depth_pixel_format = WMTPixelFormatDepth32Float;
   info.raster_sample_count = 1;
 
   bool streamUsed[MAX_STREAMS] = {};
@@ -2026,6 +2168,28 @@ uint32_t D9MTDevice::GetOrCreateSampler(UINT slot) {
   return idx;
 }
 
+obj_handle_t D9MTDevice::GetOrCreateDsso() {
+  DWORD zenable = m_renderStates[D3DRS_ZENABLE] != D3DZB_FALSE;
+  DWORD zwrite = m_renderStates[D3DRS_ZWRITEENABLE] != 0;
+  DWORD zfunc = m_renderStates[D3DRS_ZFUNC];
+  uint32_t key = (zenable ? 1u : 0) | (zwrite ? 2u : 0) | (zfunc & 15) << 2;
+  for (auto &e : m_dssoCache)
+    if (e.key == key)
+      return e.handle;
+
+  WMTDepthStencilInfo info = {};
+  info.depth_compare_function =
+      zenable ? d3dcmp_to_wmt(zfunc) : WMTCompareFunctionAlways;
+  info.depth_write_enabled = zenable && zwrite;
+  obj_handle_t dsso = MTLDevice_newDepthStencilState(m_mtlDevice, &info);
+  if (!dsso) {
+    log_msg("GetOrCreateDsso: newDepthStencilState failed (key %x)", key);
+    return 0;
+  }
+  m_dssoCache.push_back({key, dsso});
+  return dsso;
+}
+
 void D9MTDevice::MarkResident(obj_handle_t res) {
   for (obj_handle_t r : m_frameResident)
     if (r == res)
@@ -2063,6 +2227,62 @@ bool D9MTDevice::PrepareDraw() {
     auto *sp = AppendCmd<wmtcmd_render_setpso>(WMTRenderCommandSetPSO);
     sp->pso = pso;
     m_lastPso = pso;
+  }
+
+  obj_handle_t dsso = GetOrCreateDsso();
+  if (dsso && dsso != m_lastDsso) {
+    auto *sd = AppendCmd<wmtcmd_render_setdsso>(WMTRenderCommandSetDSSO);
+    sd->dsso = dsso;
+    sd->stencil_ref = 0;
+    m_lastDsso = dsso;
+  }
+
+  // cull mode (D3D9 front faces wind clockwise; CW culls front, CCW back)
+  {
+    DWORD cull = m_renderStates[D3DRS_CULLMODE];
+    uint32_t rasterKey = cull & 7;
+    if (rasterKey != m_lastRaster) {
+      auto *rst = AppendCmd<wmtcmd_render_setrasterizerstate>(
+          WMTRenderCommandSetRasterizerState);
+      rst->fill_mode = WMTTriangleFillModeFill;
+      rst->cull_mode = cull == D3DCULL_CW    ? WMTCullModeFront
+                       : cull == D3DCULL_CCW ? WMTCullModeBack
+                                             : WMTCullModeNone;
+      rst->depth_clip_mode = (WMTDepthClipMode)0; // clip
+      rst->winding = WMTWindingClockwise;
+      m_lastRaster = rasterKey;
+    }
+  }
+
+  // viewport + scissor (scissor must stay inside the render target;
+  // when the test is off Metal still wants a rect, so bind full-RT)
+  {
+    bool scissorOn =
+        m_renderStates[D3DRS_SCISSORTESTENABLE] != 0 && m_scissorSet;
+    uint64_t vsKey = ((uint64_t)scissorOn << 63) |
+                     ((uint64_t)m_viewportSet << 62) |
+                     ((uint64_t)(m_viewport.X ^ m_viewport.Width) << 32) |
+                     (scissorOn ? (uint32_t)(m_scissor.left ^ m_scissor.right ^
+                                             m_scissor.top ^ m_scissor.bottom)
+                                : 0u);
+    if (vsKey != m_lastViewScissor) {
+      if (m_viewportSet) {
+        auto *vp =
+            AppendCmd<wmtcmd_render_setviewport>(WMTRenderCommandSetViewport);
+        vp->viewport = {(double)m_viewport.X, (double)m_viewport.Y,
+                        (double)m_viewport.Width, (double)m_viewport.Height,
+                        (double)m_viewport.MinZ, (double)m_viewport.MaxZ};
+      }
+      auto *sc = AppendCmd<wmtcmd_render_setscissorrect>(
+          WMTRenderCommandSetScissorRect);
+      if (scissorOn)
+        sc->scissor_rect = {(uint64_t)m_scissor.left, (uint64_t)m_scissor.top,
+                            (uint64_t)(m_scissor.right - m_scissor.left),
+                            (uint64_t)(m_scissor.bottom - m_scissor.top)};
+      else
+        sc->scissor_rect = {0, 0, m_width, m_height};
+      m_lastViewScissor = vsKey;
+    }
   }
 
   // render_state push block, shared by both stages
@@ -2269,6 +2489,11 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   pass.colors[0].clear_color.g = ((m_clearColor >> 8) & 0xff) / 255.0;
   pass.colors[0].clear_color.b = (m_clearColor & 0xff) / 255.0;
   pass.colors[0].clear_color.a = ((m_clearColor >> 24) & 0xff) / 255.0;
+  // single render pass per frame: depth always attached, cleared at load
+  pass.depth.texture = m_depthTex;
+  pass.depth.load_action = WMTLoadActionClear;
+  pass.depth.store_action = WMTStoreActionDontCare;
+  pass.depth.clear_depth = m_clearDepth;
 
   obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(cmdbuf, &pass);
   if (enc) {
@@ -2328,6 +2553,9 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   m_ringResident = false;
   m_frameResident.clear();
   m_lastPso = 0;
+  m_lastDsso = 0;
+  m_lastRaster = ~0u;
+  m_lastViewScissor = ~0ull;
 
   static int presented = 0;
   if (presented < 3) {

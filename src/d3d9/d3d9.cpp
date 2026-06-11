@@ -1222,7 +1222,10 @@ public:
   // swapchain / lifecycle
   HRESULT STDMETHODCALLTYPE TestCooperativeLevel() override { return D3D_OK; }
   UINT STDMETHODCALLTYPE GetAvailableTextureMem() override {
-    return 512u << 20;
+    // GTA IV sizes its streaming/LOD budget (draw distance) from this;
+    // M1 Max unified memory is effectively huge - report near the 32-bit
+    // ceiling like DXVK does
+    return 3072u << 20;
   }
   HRESULT STDMETHODCALLTYPE EvictManagedResources() override { return D3D_OK; }
   HRESULT STDMETHODCALLTYPE GetDirect3D(IDirect3D9 **ppD3D9) override;
@@ -3294,16 +3297,19 @@ bool D9MTDevice::PrepareDraw() {
 
     UINT cbOff = 0;
     if (si.idCbuffer >= 0) {
-      UINT cbSize = 16 * 16 + si.floatConstCount * 16;
+      // upload only the constant prefix the shader can read (dxso meta,
+      // covers relative addressing); the declared tail is never accessed
+      UINT usedF = si.usedFloatConsts;
+      UINT cbSize = 16 * 16 + usedF * 16;
       uint8_t *cb = (uint8_t *)RingAlloc(cbSize, &cbOff);
       if (!cb)
         return false;
       if (stage) {
         memcpy(cb, m_psConstI, sizeof(m_psConstI));
-        memcpy(cb + sizeof(m_psConstI), m_psConstF, si.floatConstCount * 16);
+        memcpy(cb + sizeof(m_psConstI), m_psConstF, usedF * 16);
       } else {
         memcpy(cb, m_vsConstI, sizeof(m_vsConstI));
-        memcpy(cb + sizeof(m_vsConstI), m_vsConstF, si.floatConstCount * 16);
+        memcpy(cb + sizeof(m_vsConstI), m_vsConstF, usedF * 16);
       }
     }
 

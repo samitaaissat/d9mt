@@ -54,6 +54,11 @@ bool d9mt_translate(const void *bytecode, D9MTShaderInfo &out,
     Rc<DxvkShader> shader = module.compile(moduleInfo, "d9mt", analysis,
                                            layout);
 
+    const DxsoShaderMetaInfo &meta = module.meta();
+    out.usedFloatConsts = meta.maxConstIndexF < layout.floatCount
+                              ? meta.maxConstIndexF
+                              : layout.floatCount;
+
     // vertex input signature: semantic -> linker slot (= SPIR-V location,
     // = MSL [[attribute(N)]]); the isgn is produced by compile()
     if (out.isVertexShader) {

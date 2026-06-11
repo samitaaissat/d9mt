@@ -40,7 +40,10 @@ struct D9MTShaderInfo {
   // creating the function unspecialized crashes PSO creation.
   std::vector<std::pair<uint32_t, uint32_t>> specConstants;
 
-  uint32_t floatConstCount = 0;    // 256 (VS) / 224 (PS)
+  uint32_t floatConstCount = 0;    // 256 (VS) / 224 (PS), declared size
+  // highest float constant the shader can read (dxso meta; accounts for
+  // relative addressing) - upload only this prefix
+  uint32_t usedFloatConsts = 0;
 };
 
 // Returns false and fills err on failure. bytecode is the D3D9 shader

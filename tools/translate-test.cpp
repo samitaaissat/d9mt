@@ -24,7 +24,8 @@ int main(int argc, char **argv) {
   }
 
   printf("type: %s\n", si.isVertexShader ? "vs" : "ps");
-  printf("floatConstCount: %u\n", si.floatConstCount);
+  printf("floatConstCount: %u (used: %u)\n", si.floatConstCount,
+         si.usedFloatConsts);
   for (auto &i : si.inputs)
     printf("input: usage=%u usageIndex=%u -> attribute(%u)\n", i.usage,
            i.usageIndex, i.location);

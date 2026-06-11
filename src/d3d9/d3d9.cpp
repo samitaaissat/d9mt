@@ -250,6 +250,20 @@ static bool d3dfmt_to_wmt(D3DFORMAT fmt, D9MTFormatInfo *out) {
   }
 }
 
+// linear -> sRGB pixel format sibling (0 = none)
+static uint32_t wmt_srgb_variant(uint32_t fmt) {
+  switch (fmt) {
+  case WMTPixelFormatBGRA8Unorm: return WMTPixelFormatBGRA8Unorm_sRGB;
+  case WMTPixelFormatRGBA8Unorm: return WMTPixelFormatRGBA8Unorm_sRGB;
+  case WMTPixelFormatR8Unorm:    return WMTPixelFormatR8Unorm_sRGB;
+  case WMTPixelFormatRG8Unorm:   return WMTPixelFormatRG8Unorm_sRGB;
+  case WMTPixelFormatBC1_RGBA:   return WMTPixelFormatBC1_RGBA_sRGB;
+  case WMTPixelFormatBC2_RGBA:   return WMTPixelFormatBC2_RGBA_sRGB;
+  case WMTPixelFormatBC3_RGBA:   return WMTPixelFormatBC3_RGBA_sRGB;
+  default:                       return 0;
+  }
+}
+
 static bool d3dfmt_is_depth(D3DFORMAT fmt) {
   switch ((DWORD)fmt) {
   case D3DFMT_D16:
@@ -538,6 +552,18 @@ using D9MTPixelShader = D9MTShaderBase<IDirect3DPixelShader9>;
 
 class D9MTSurface;
 
+// defined after D9MTDevice: queues a GPU mip generation for this frame
+static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, obj_handle_t tex);
+
+static UINT full_mip_chain(UINT w, UINT h) {
+  UINT dim = w > h ? w : h, levels = 1;
+  while (dim > 1) {
+    dim >>= 1;
+    levels++;
+  }
+  return levels;
+}
+
 // 2D texture: shared-storage MTLTexture with the full mip chain, plus a
 // sysmem staging copy. LockRect hands out staging memory; UnlockRect
 // uploads the level with replaceRegion.
@@ -547,12 +573,10 @@ public:
               D3DFORMAT format, const D9MTFormatInfo &fi)
       : m_device(dev), m_width(width), m_height(height), m_format(format),
         m_fmtInfo(fi) {
-    if (!levels) { // 0 = full chain down to 1x1
-      UINT dim = width > height ? width : height;
-      for (levels = 1; dim > 1; dim >>= 1)
-        levels++;
-    }
+    if (!levels) // 0 = full chain down to 1x1
+      levels = full_mip_chain(width, height);
     m_levels = levels;
+    m_mtlLevels = levels;
     UINT off = 0;
     for (UINT l = 0; l < m_levels; l++) {
       m_levelOffset.push_back(off);
@@ -564,6 +588,11 @@ public:
   ~D9MTTexture();
 
   bool Create(obj_handle_t mtlDevice, DWORD d3dUsage = 0) {
+    // autogen: app fills level 0 only, the GPU builds the chain
+    if ((d3dUsage & D3DUSAGE_AUTOGENMIPMAP) && !d3dfmt_is_depth(m_format)) {
+      m_autogen = true;
+      m_mtlLevels = full_mip_chain(m_width, m_height);
+    }
     WMTTextureInfo info = {};
     info.pixel_format = (WMTPixelFormat)m_fmtInfo.wmt;
     info.width = m_width;
@@ -571,7 +600,7 @@ public:
     info.depth = 1;
     info.array_length = 1;
     info.type = WMTTextureType2D;
-    info.mipmap_level_count = m_levels;
+    info.mipmap_level_count = m_mtlLevels;
     info.sample_count = 1;
     info.usage = WMTTextureUsageShaderRead;
     if (m_fmtInfo.swizzled)
@@ -592,7 +621,7 @@ public:
       // shaders sample through a view carrying the D3D9 channel mapping;
       // uploads still go to the plain base texture
       m_view = MTLTexture_newTextureView(
-          m_tex, (WMTPixelFormat)m_fmtInfo.wmt, WMTTextureType2D, 0, m_levels,
+          m_tex, (WMTPixelFormat)m_fmtInfo.wmt, WMTTextureType2D, 0, m_mtlLevels,
           0, 1, m_fmtInfo.swizzle, &m_gpuId);
       if (!m_view)
         return false;
@@ -604,6 +633,30 @@ public:
   obj_handle_t SampleHandle() const { return m_view ? m_view : m_tex; }
   const D9MTFormatInfo &FmtInfo() const { return m_fmtInfo; }
   bool IsDepth() const { return d3dfmt_is_depth(m_format); }
+
+  // lazy sRGB sampling view (D3DSAMP_SRGBTEXTURE); 0 if no sRGB sibling
+  uint64_t SrgbGpuId() {
+    if (m_srgbGpuId)
+      return m_srgbGpuId;
+    uint32_t sfmt = wmt_srgb_variant(m_fmtInfo.wmt);
+    if (!sfmt)
+      return 0;
+    WMTTextureSwizzleChannels sw = m_fmtInfo.swizzled
+                                       ? m_fmtInfo.swizzle
+                                       : WMTTextureSwizzleChannels{
+                                             WMTTextureSwizzleRed,
+                                             WMTTextureSwizzleGreen,
+                                             WMTTextureSwizzleBlue,
+                                             WMTTextureSwizzleAlpha};
+    m_srgbView = MTLTexture_newTextureView(
+        m_tex, (WMTPixelFormat)sfmt, WMTTextureType2D, 0, m_mtlLevels, 0, 1, sw,
+        &m_srgbGpuId);
+    return m_srgbView ? m_srgbGpuId : 0;
+  }
+  obj_handle_t SrgbViewHandle() {
+    SrgbGpuId();
+    return m_srgbView;
+  }
 
   UINT LevelWidth(UINT l) const { return m_width >> l ? m_width >> l : 1; }
   UINT LevelHeight(UINT l) const { return m_height >> l ? m_height >> l : 1; }
@@ -671,7 +724,8 @@ public:
     return D3DTEXF_LINEAR;
   }
   void STDMETHODCALLTYPE GenerateMipSubLevels() override {
-    STUB_ONCE("GenerateMipSubLevels");
+    if (m_tex && m_mtlLevels > 1)
+      d9mt_queue_mipgen(m_device, m_tex);
   }
 
   // IDirect3DTexture9
@@ -717,6 +771,8 @@ public:
     data.set(m_staging.data() + m_levelOffset[Level]);
     MTLTexture_replaceRegion(m_tex, origin, size, Level, 0, data,
                              RowBytes(Level), 0);
+    if (m_autogen && Level == 0)
+      d9mt_queue_mipgen(m_device, m_tex);
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE AddDirtyRect(const RECT *) override {
@@ -726,7 +782,11 @@ public:
   obj_handle_t m_tex = 0;
   obj_handle_t m_view = 0; // swizzled view, when the format needs one
   uint64_t m_gpuId = 0;    // of the handle shaders sample (view if present)
+  obj_handle_t m_srgbView = 0;
+  uint64_t m_srgbGpuId = 0;
   bool m_noUpload = false; // private storage: UnlockRect skips replaceRegion
+  bool m_autogen = false;
+  UINT m_mtlLevels = 1; // Metal chain length (> m_levels for autogen)
 
 private:
   volatile LONG m_refcount = 1;
@@ -813,6 +873,8 @@ private:
 D9MTTexture::~D9MTTexture() {
   for (D9MTSurface *s : m_surfaces)
     delete s;
+  if (m_srgbView)
+    NSObject_release(m_srgbView);
   if (m_view)
     NSObject_release(m_view);
   if (m_tex)
@@ -1082,6 +1144,7 @@ class D9MTInterface;
 
 class D9MTDevice final : public IDirect3DDevice9Ex {
   friend class D9MTInterface; // CreateDevice seeds m_pp
+  friend void d9mt_queue_mipgen(IDirect3DDevice9 *, obj_handle_t);
 public:
   D9MTDevice(D9MTInterface *parent, HWND hwnd, UINT width, UINT height)
       : m_parent(parent), m_hwnd(hwnd), m_width(width), m_height(height) {
@@ -1102,6 +1165,7 @@ public:
     m_renderStates[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
     m_renderStates[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
     m_renderStates[D3DRS_COLORWRITEENABLE] = 0xF;
+    m_renderStates[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
   }
 
   HRESULT Init();
@@ -1644,8 +1708,14 @@ public:
   }
   HRESULT STDMETHODCALLTYPE SetRenderState(D3DRENDERSTATETYPE State,
                                            DWORD Value) override {
-    if ((DWORD)State < MAX_RENDER_STATES)
+    if ((DWORD)State < MAX_RENDER_STATES) {
+      // sRGB write is baked into the pass attachment: changing it splits
+      // the pass
+      if (State == D3DRS_SRGBWRITEENABLE &&
+          (m_renderStates[State] != 0) != (Value != 0))
+        ClosePass();
       m_renderStates[State] = Value;
+    }
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE GetRenderState(D3DRENDERSTATETYPE State,
@@ -2207,6 +2277,7 @@ private:
   // drawable. colorTex==0 means the swapchain drawable.
   struct PassRec {
     bool isBlit = false;
+    bool srgbBB = false;       // proxy pass writes through the sRGB view
     obj_handle_t colorTex = 0; // 0 = backbuffer proxy texture
     uint16_t colorLevel = 0;
     uint32_t colorFmt = WMTPixelFormatBGRA8Unorm;
@@ -2242,6 +2313,16 @@ private:
     obj_handle_t tex;
   };
   std::vector<DepthCacheEntry> m_depthCache;
+
+  // textures needing GPU mip generation this frame (autogen /
+  // GenerateMipSubLevels); blitted at the head of the Present cmdbuf
+  std::vector<obj_handle_t> m_pendingMipGen;
+  void QueueMipGen(obj_handle_t tex) {
+    for (obj_handle_t t : m_pendingMipGen)
+      if (t == tex)
+        return;
+    m_pendingMipGen.push_back(tex);
+  }
 
   // PSO cache for the programmable path
   struct PsoKey {
@@ -2286,6 +2367,7 @@ private:
   // backbuffer proxy: passes render here; Present blits it to the
   // drawable. Lets StretchRect read the "backbuffer" mid-frame.
   obj_handle_t m_bbTex = 0;
+  obj_handle_t m_bbTexSrgb = 0; // sRGB-write view of the proxy
   UINT m_lastPosW = 0, m_lastPosH = 0; // Reset window-positioning guard
   float m_clearDepth = 1.0f;
   D3DVIEWPORT9 m_viewport = {};
@@ -2531,6 +2613,8 @@ D9MTDevice::~D9MTDevice() {
     m_autoDepth->Release();
   if (m_depthTex)
     NSObject_release(m_depthTex);
+  if (m_bbTexSrgb)
+    NSObject_release(m_bbTexSrgb);
   if (m_bbTex)
     NSObject_release(m_bbTex);
   for (auto &e : m_depthCache)
@@ -2846,7 +2930,13 @@ uint32_t D9MTDevice::GetOrCreateSampler(UINT slot) {
   return idx;
 }
 
+static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, obj_handle_t tex) {
+  static_cast<D9MTDevice *>(dev)->QueueMipGen(tex);
+}
+
 bool D9MTDevice::CreateBackbufferProxy() {
+  if (m_bbTexSrgb)
+    NSObject_release(m_bbTexSrgb);
   if (m_bbTex)
     NSObject_release(m_bbTex);
   WMTTextureInfo ti = {};
@@ -2862,7 +2952,18 @@ bool D9MTDevice::CreateBackbufferProxy() {
       (WMTTextureUsage)(WMTTextureUsageRenderTarget | WMTTextureUsageShaderRead);
   ti.options = WMTResourceStorageModePrivate;
   m_bbTex = MTLDevice_newTexture(m_mtlDevice, &ti);
-  return m_bbTex != 0;
+  if (!m_bbTex)
+    return false;
+  // sRGB-write view of the proxy (D3DRS_SRGBWRITEENABLE passes)
+  uint64_t dummy = 0;
+  WMTTextureSwizzleChannels ident = {WMTTextureSwizzleRed,
+                                     WMTTextureSwizzleGreen,
+                                     WMTTextureSwizzleBlue,
+                                     WMTTextureSwizzleAlpha};
+  m_bbTexSrgb =
+      MTLTexture_newTextureView(m_bbTex, WMTPixelFormatBGRA8Unorm_sRGB,
+                                WMTTextureType2D, 0, 1, 0, 1, ident, &dummy);
+  return true;
 }
 
 // surface -> Metal texture for blits: backbuffer/placeholder surfaces map
@@ -2922,6 +3023,7 @@ void D9MTDevice::OpenPass() {
   m_curPass.width = m_width;
   m_curPass.height = m_height;
 
+  bool srgbWrite = m_renderStates[D3DRS_SRGBWRITEENABLE] != 0;
   D9MTSurface *rts = nullptr;
   if (m_rt0)
     m_rt0->QueryInterface(IID_D9MTTexSurface, (void **)&rts);
@@ -2930,10 +3032,22 @@ void D9MTDevice::OpenPass() {
     m_curPass.colorTex = tex->m_tex;
     m_curPass.colorLevel = (uint16_t)rts->Level();
     m_curPass.colorFmt = tex->FmtInfo().wmt;
+    if (srgbWrite) {
+      obj_handle_t sv = tex->SrgbViewHandle();
+      if (sv) {
+        m_curPass.colorTex = sv;
+        m_curPass.colorFmt = wmt_srgb_variant(tex->FmtInfo().wmt);
+      }
+    }
     m_curPass.width = tex->LevelWidth(rts->Level());
     m_curPass.height = tex->LevelHeight(rts->Level());
+  } else {
+    // backbuffer / placeholder -> proxy (colorTex 0)
+    if (srgbWrite && m_bbTexSrgb) {
+      m_curPass.srgbBB = true;
+      m_curPass.colorFmt = WMTPixelFormatBGRA8Unorm_sRGB;
+    }
   }
-  // else: backbuffer / placeholder -> drawable (colorTex 0)
 
   D9MTSurface *dss = nullptr;
   if (m_dsSurface)
@@ -3144,8 +3258,21 @@ bool D9MTDevice::PrepareDraw() {
         ab[si.idCbuffer] = m_ring.gpuAddr + cbOff;
       if (si.idClipInfo >= 0)
         ab[si.idClipInfo] = m_ring.gpuAddr + m_clipInfoOffset;
-      if (si.idSpecState >= 0)
-        ab[si.idSpecState] = m_ring.gpuAddr + m_specStateOffset;
+      if (si.idSpecState >= 0) {
+        UINT specOff = m_specStateOffset;
+        if (stage && m_renderStates[D3DRS_ALPHATESTENABLE]) {
+          // dynamic spec block: alpha compare op in dword1 bits [21,24)
+          uint32_t *spec = (uint32_t *)RingAlloc(64, &specOff);
+          if (!spec)
+            return false;
+          memset(spec, 0, 64);
+          spec[1] = ((uint32_t)d3dcmp_to_wmt(m_renderStates[D3DRS_ALPHAFUNC]) &
+                     7u)
+                    << 21;
+          rs->alpha_ref = m_renderStates[D3DRS_ALPHAREF] & 0xFF;
+        }
+        ab[si.idSpecState] = m_ring.gpuAddr + specOff;
+      }
       for (const auto &tb : si.textures) {
         if (!stage) {
           STUB_ONCE("vertex texture fetch");
@@ -3157,8 +3284,15 @@ bool D9MTDevice::PrepareDraw() {
           continue; // slot empty: shader reads a null texture handle
         // the handle lands in both the plain and _shadow variants; the
         // spec_state-selected branch decides which one executes
-        ab[tb.abId] = tex->m_gpuId;
-        MarkResident(tex->SampleHandle());
+        uint64_t gid = tex->m_gpuId;
+        if (m_samplerStates[tb.samplerSlot][D3DSAMP_SRGBTEXTURE]) {
+          uint64_t sg = tex->SrgbGpuId();
+          if (sg)
+            gid = sg;
+        }
+        ab[tb.abId] = gid;
+        MarkResident(gid == tex->m_gpuId ? tex->SampleHandle()
+                                         : tex->SrgbViewHandle());
         samplerIdx[tb.samplerSlot] =
             (uint16_t)GetOrCreateSampler(tb.samplerSlot);
       }
@@ -3327,6 +3461,26 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
   obj_handle_t drawTex = MetalDrawable_texture(drawable);
   obj_handle_t cmdbuf = MTLCommandQueue_commandBuffer(m_queue);
 
+  // GPU mip generation for textures uploaded this frame, ahead of every
+  // pass that samples them
+  if (!m_pendingMipGen.empty()) {
+    std::vector<wmtcmd_blit_generate_mipmaps> gens(m_pendingMipGen.size());
+    for (size_t i = 0; i < gens.size(); i++) {
+      memset(&gens[i], 0, sizeof(gens[i]));
+      gens[i].type = WMTBlitCommandGenerateMipmaps;
+      gens[i].texture = m_pendingMipGen[i];
+      if (i + 1 < gens.size())
+        gens[i].next.set(&gens[i + 1]);
+    }
+    obj_handle_t benc = MTLCommandBuffer_blitCommandEncoder(cmdbuf);
+    if (benc) {
+      MTLBlitCommandEncoder_encodeCommands(
+          benc, (const wmtcmd_base *)gens.data());
+      MTLCommandEncoder_endEncoding(benc);
+    }
+    m_pendingMipGen.clear();
+  }
+
   bool bbTouched = false;
   auto encodePass = [&](const PassRec &p, const wmtcmd_base *head) {
     if (p.isBlit) {
@@ -3349,7 +3503,8 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
     }
     WMTRenderPassInfo pass = {};
     bool toBB = p.colorTex == 0; // "backbuffer" = the proxy texture
-    pass.colors[0].texture = toBB ? m_bbTex : p.colorTex;
+    pass.colors[0].texture =
+        toBB ? (p.srgbBB ? m_bbTexSrgb : m_bbTex) : p.colorTex;
     pass.colors[0].level = p.colorLevel;
     pass.colors[0].store_action = WMTStoreActionStore;
     if (p.clearColor) {

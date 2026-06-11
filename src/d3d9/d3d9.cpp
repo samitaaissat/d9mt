@@ -1542,24 +1542,33 @@ public:
                                         IDirect3DSurface9 *pDestSurface,
                                         const RECT *pDestRect,
                                         D3DTEXTUREFILTERTYPE Filter) override {
-    obj_handle_t src, dst;
-    uint32_t sl, dl;
-    UINT sw, sh, dw, dh;
-    if (!ResolveSurfaceTex(pSourceSurface, &src, &sl, &sw, &sh) ||
-        !ResolveSurfaceTex(pDestSurface, &dst, &dl, &dw, &dh))
+    SurfaceTexInfo s, d;
+    if (!ResolveSurfaceTex(pSourceSurface, &s) ||
+        !ResolveSurfaceTex(pDestSurface, &d))
       return D3DERR_INVALIDCALL;
-    if (sw != dw || sh != dh)
-      STUB_ONCE("StretchRect: scaling copy degraded to min-size blit");
-    // copy slots into the pass stream in submission order
+    // copies/scales enter the pass stream in submission order
     ClosePass();
     PassRec blit = {};
-    blit.isBlit = true;
-    blit.blitSrc = src;
-    blit.blitDst = dst;
-    blit.blitSrcLevel = sl;
-    blit.blitDstLevel = dl;
-    blit.blitW = sw < dw ? sw : dw;
-    blit.blitH = sh < dh ? sh : dh;
+    if (s.w == d.w && s.h == d.h && s.fmt == d.fmt) {
+      blit.isBlit = true;
+      blit.blitSrc = s.tex;
+      blit.blitDst = d.tex;
+      blit.blitSrcLevel = s.level;
+      blit.blitDstLevel = d.level;
+      blit.blitW = s.w;
+      blit.blitH = s.h;
+    } else {
+      // scaling (or converting) copy: fullscreen-triangle sample pass
+      // (GTA IV's bloom chain downsamples the backbuffer this way)
+      blit.isBlit = true;
+      blit.isScaleBlit = true;
+      blit.blitSrc = s.sample;
+      blit.blitDst = d.tex;
+      blit.blitDstLevel = d.level;
+      blit.scaleDstFmt = d.fmt;
+      blit.blitW = d.w;
+      blit.blitH = d.h;
+    }
     m_passes.push_back(blit);
     return D3D_OK;
   }
@@ -2332,6 +2341,9 @@ private:
     obj_handle_t blitSrc = 0, blitDst = 0;
     uint32_t blitSrcLevel = 0, blitDstLevel = 0;
     UINT blitW = 0, blitH = 0;
+    // scale-blit fields (isScaleBlit): fullscreen-triangle sample pass
+    bool isScaleBlit = false;
+    uint32_t scaleDstFmt = 0;
   };
   std::vector<PassRec> m_passes;
   PassRec m_curPass;
@@ -2354,6 +2366,12 @@ private:
 
   // textures needing GPU mip generation this frame (autogen /
   // GenerateMipSubLevels); blitted at the head of the Present cmdbuf
+  // scaled-blit pipeline (blit_vs/blit_ps from the embedded metallib),
+  // one PSO per destination format
+  obj_handle_t m_blitVs = 0, m_blitPs = 0;
+  std::vector<std::pair<uint32_t, obj_handle_t>> m_blitPsoCache;
+  obj_handle_t GetBlitPso(uint32_t dstFmt);
+
   std::vector<D9MTTexture *> m_pendingMipGen;
   void QueueMipGen(D9MTTexture *tex) {
     for (D9MTTexture *t : m_pendingMipGen)
@@ -2466,8 +2484,14 @@ private:
   void ClosePass();
   obj_handle_t GetDepthForSize(UINT w, UINT h);
   bool CreateBackbufferProxy();
-  bool ResolveSurfaceTex(IDirect3DSurface9 *surf, obj_handle_t *tex,
-                         uint32_t *level, UINT *w, UINT *h);
+  struct SurfaceTexInfo {
+    obj_handle_t tex = 0;    // base texture (blit src/dst)
+    obj_handle_t sample = 0; // sampleable handle (swizzled view if any)
+    uint32_t level = 0;
+    uint32_t fmt = 0;
+    UINT w = 0, h = 0;
+  };
+  bool ResolveSurfaceTex(IDirect3DSurface9 *surf, SurfaceTexInfo *out);
 };
 
 HRESULT D9MTDevice::Init() {
@@ -2646,6 +2670,12 @@ D9MTDevice::~D9MTDevice() {
     NSObject_release(s.handle);
   for (auto &d : m_dssoCache)
     NSObject_release(d.handle);
+  for (auto &b : m_blitPsoCache)
+    NSObject_release(b.second);
+  if (m_blitVs)
+    NSObject_release(m_blitVs);
+  if (m_blitPs)
+    NSObject_release(m_blitPs);
   if (m_swapChain)
     m_swapChain->Release();
   if (m_backBuffer)
@@ -2988,6 +3018,39 @@ static void d9mt_queue_mipgen(IDirect3DDevice9 *dev, D9MTTexture *tex) {
   static_cast<D9MTDevice *>(dev)->QueueMipGen(tex);
 }
 
+obj_handle_t D9MTDevice::GetBlitPso(uint32_t dstFmt) {
+  for (auto &e : m_blitPsoCache)
+    if (e.first == dstFmt)
+      return e.second;
+  if (!m_blitVs) {
+    m_blitVs = MTLLibrary_newFunction(m_library, "blit_vs");
+    m_blitPs = MTLLibrary_newFunction(m_library, "blit_ps");
+    if (!m_blitVs || !m_blitPs) {
+      log_msg("GetBlitPso: blit functions missing from metallib");
+      return 0;
+    }
+  }
+  WMTRenderPipelineInfo info = {};
+  info.colors[0].pixel_format = (WMTPixelFormat)dstFmt;
+  info.colors[0].write_mask = WMTColorWriteMaskAll;
+  info.rasterization_enabled = true;
+  info.raster_sample_count = 1;
+  info.depth_pixel_format = WMTPixelFormatInvalid;
+  info.stencil_pixel_format = WMTPixelFormatInvalid;
+  info.vertex_function = m_blitVs;
+  info.fragment_function = m_blitPs;
+  info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+  info.max_tessellation_factor = 16;
+  obj_handle_t err = 0;
+  obj_handle_t pso = MTLDevice_newRenderPipelineState(m_mtlDevice, &info, &err);
+  if (!pso) {
+    log_nserror("GetBlitPso", err);
+    return 0;
+  }
+  m_blitPsoCache.push_back({dstFmt, pso});
+  return pso;
+}
+
 bool D9MTDevice::CreateBackbufferProxy() {
   if (m_bbTexSrgb)
     NSObject_release(m_bbTexSrgb);
@@ -3022,24 +3085,29 @@ bool D9MTDevice::CreateBackbufferProxy() {
 
 // surface -> Metal texture for blits: backbuffer/placeholder surfaces map
 // to the proxy, texture surfaces to their parent's texture+level
-bool D9MTDevice::ResolveSurfaceTex(IDirect3DSurface9 *surf, obj_handle_t *tex,
-                                   uint32_t *level, UINT *w, UINT *h) {
+bool D9MTDevice::ResolveSurfaceTex(IDirect3DSurface9 *surf,
+                                   SurfaceTexInfo *out) {
   if (!surf)
     return false;
   D9MTSurface *ts = nullptr;
   surf->QueryInterface(IID_D9MTTexSurface, (void **)&ts);
   if (ts) {
-    *tex = ts->Parent()->m_tex;
-    *level = ts->Level();
-    *w = ts->Parent()->LevelWidth(ts->Level());
-    *h = ts->Parent()->LevelHeight(ts->Level());
+    D9MTTexture *t = ts->Parent();
+    out->tex = t->m_tex;
+    out->sample = t->SampleHandle();
+    out->level = ts->Level();
+    out->fmt = t->FmtInfo().wmt;
+    out->w = t->LevelWidth(ts->Level());
+    out->h = t->LevelHeight(ts->Level());
     return true;
   }
   // plain surface: treat as the backbuffer proxy
-  *tex = m_bbTex;
-  *level = 0;
-  *w = m_width;
-  *h = m_height;
+  out->tex = m_bbTex;
+  out->sample = m_bbTex;
+  out->level = 0;
+  out->fmt = WMTPixelFormatBGRA8Unorm;
+  out->w = m_width;
+  out->h = m_height;
   return true;
 }
 
@@ -3558,6 +3626,46 @@ HRESULT D9MTDevice::Present(const RECT *pSourceRect, const RECT *pDestRect,
 
   bool bbTouched = false;
   auto encodePass = [&](const PassRec &p, const wmtcmd_base *head) {
+    if (p.isScaleBlit) {
+      obj_handle_t pso = GetBlitPso(p.scaleDstFmt);
+      if (!pso)
+        return;
+      WMTRenderPassInfo pass = {};
+      pass.colors[0].texture = p.blitDst;
+      pass.colors[0].level = (uint16_t)p.blitDstLevel;
+      pass.colors[0].load_action = WMTLoadActionDontCare;
+      pass.colors[0].store_action = WMTStoreActionStore;
+      obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(cmdbuf, &pass);
+      if (!enc)
+        return;
+      struct wmtcmd_render_setpso sp = {};
+      struct wmtcmd_render_useresource use = {};
+      struct wmtcmd_render_settexture st = {};
+      struct wmtcmd_render_draw draw = {};
+      sp.type = WMTRenderCommandSetPSO;
+      sp.next.set(&use);
+      sp.pso = pso;
+      use.type = WMTRenderCommandUseResource;
+      use.next.set(&st);
+      use.resource = p.blitSrc;
+      use.usage = WMTResourceUsageRead;
+      use.stages = (WMTRenderStages)(WMTRenderStageFragment);
+      st.type = WMTRenderCommandSetFragmentTexture;
+      st.next.set(&draw);
+      st.texture = p.blitSrc;
+      st.index = 0;
+      draw.type = WMTRenderCommandDraw;
+      draw.primitive_type = WMTPrimitiveTypeTriangle;
+      draw.vertex_start = 0;
+      draw.vertex_count = 3;
+      draw.instance_count = 1;
+      MTLRenderCommandEncoder_encodeCommands(enc,
+                                             (const wmtcmd_base *)&sp);
+      MTLCommandEncoder_endEncoding(enc);
+      if (p.blitDst == m_bbTex)
+        bbTouched = true;
+      return;
+    }
     if (p.isBlit) {
       struct wmtcmd_blit_copy_from_texture_to_texture cp = {};
       cp.type = WMTBlitCommandCopyFromTextureToTexture;

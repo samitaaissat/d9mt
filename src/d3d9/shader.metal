@@ -29,3 +29,24 @@ vertex VOut vs_main(uint vid [[vertex_id]],
 fragment float4 ps_main(VOut in [[stage_in]]) {
   return in.color;
 }
+
+// Scaled blit (StretchRect with size change): fullscreen triangle that
+// samples the source with linear filtering.
+struct BlitOut {
+  float4 pos [[position]];
+  float2 uv;
+};
+
+vertex BlitOut blit_vs(uint vid [[vertex_id]]) {
+  BlitOut o;
+  float2 uv = float2((vid << 1) & 2, vid & 2);
+  o.uv = uv;
+  o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  return o;
+}
+
+fragment float4 blit_ps(BlitOut in [[stage_in]],
+                        texture2d<float> src [[texture(0)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  return src.sample(s, in.uv);
+}

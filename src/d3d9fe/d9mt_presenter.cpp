@@ -225,6 +225,143 @@ fragment float4 d9mt_blit_ps_point(d9mt_blit_vout in [[stage_in]],
 
 
   // ==========================================================================
+  // depth(+stencil) SAMPLE_ZERO resolve pipeline (DxvkContext::resolveImage):
+  // fullscreen triangle reading sample 0 of the MSAA source and exporting
+  // [[depth(any)]] (+ [[stencil]], shader stencil export — supported on all
+  // Apple-silicon Metal GPUs) into the 1x destination's depth/stencil
+  // attachments. Kept in its OWN MTLLibrary so a hypothetical stencil-export
+  // compile failure cannot take down the color blit pipeline above.
+  // ==========================================================================
+
+  namespace {
+
+    const char g_depthResolveMsl[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+vertex float4 d9mt_resolve_vs(uint vid [[vertex_id]]) {
+  float2 uv = float2((vid << 1) & 2, vid & 2);
+  return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+
+struct d9mt_resolve_d_out {
+  float depth [[depth(any)]];
+};
+
+fragment d9mt_resolve_d_out d9mt_resolve_d_ps(
+    float4 pos [[position]],
+    depth2d_ms<float> src [[texture(0)]]) {
+  d9mt_resolve_d_out o;
+  o.depth = src.read(uint2(pos.xy), 0);
+  return o;
+}
+
+struct d9mt_resolve_ds_out {
+  float depth [[depth(any)]];
+  uint stencil [[stencil]];
+};
+
+fragment d9mt_resolve_ds_out d9mt_resolve_ds_ps(
+    float4 pos [[position]],
+    depth2d_ms<float> src [[texture(0)]],
+    texture2d_ms<uint> stc [[texture(1)]]) {
+  d9mt_resolve_ds_out o;
+  o.depth   = src.read(uint2(pos.xy), 0);
+  o.stencil = stc.read(uint2(pos.xy), 0).x;
+  return o;
+}
+)";
+
+    bool         s_resolveInitFailed = false;
+    obj_handle_t s_resolveLibrary = 0;
+    obj_handle_t s_resolveVs = 0;
+    obj_handle_t s_resolveDPs = 0;
+    obj_handle_t s_resolveDsPs = 0;
+    obj_handle_t s_resolveDPso = 0;
+    obj_handle_t s_resolveDsPso = 0;
+
+    bool ensureResolveFunctionsLocked() {
+      if (s_resolveVs)
+        return true;
+      if (s_resolveInitFailed)
+        return false;
+
+      obj_handle_t device = mtlDevice();
+      if (!device) {
+        s_resolveInitFailed = true;
+        return false;
+      }
+
+      d9mt_newlibrary_params lp = { };
+      lp.device     = device;
+      lp.source_ptr = uint64_t(uintptr_t(g_depthResolveMsl));
+      lp.source_len = sizeof(g_depthResolveMsl) - 1u;
+      lp.fast_math  = 1u;
+
+      int st = D9MT_UnixCall(D9MT_FUNC_NEW_LIBRARY_FROM_SOURCE, &lp);
+      if (st != 0 || !lp.ret_library) {
+        Logger::err("d9mt: depth resolve: newLibraryWithSource failed");
+        logf("d9mt: depth resolve: newLibraryWithSource status %d", st);
+        if (lp.ret_error)
+          logNSError("d9mt: depth resolve MSL compile", lp.ret_error);
+        s_resolveInitFailed = true;
+        return false;
+      }
+      if (lp.ret_error)
+        NSObject_release(lp.ret_error); // compile warnings only
+
+      s_resolveLibrary = lp.ret_library;
+      s_resolveVs   = MTLLibrary_newFunction(s_resolveLibrary, "d9mt_resolve_vs");
+      s_resolveDPs  = MTLLibrary_newFunction(s_resolveLibrary, "d9mt_resolve_d_ps");
+      s_resolveDsPs = MTLLibrary_newFunction(s_resolveLibrary, "d9mt_resolve_ds_ps");
+
+      if (!s_resolveVs || !s_resolveDPs || !s_resolveDsPs) {
+        Logger::err("d9mt: depth resolve: functions missing from compiled library");
+        s_resolveInitFailed = true;
+        return false;
+      }
+      return true;
+    }
+
+  } // anonymous namespace
+
+  // non-static: used by DxvkContext::resolveImage (declared in d9mt_backend.h).
+  // All backend depth formats unify on Depth32Float_Stencil8, so there is
+  // exactly one PSO per (with/without stencil export) variant.
+  obj_handle_t getDepthResolvePso(bool withStencil) {
+    std::lock_guard<std::mutex> lock(s_blitMutex);
+
+    obj_handle_t& cached = withStencil ? s_resolveDsPso : s_resolveDPso;
+    if (cached)
+      return cached;
+
+    if (!ensureResolveFunctionsLocked())
+      return 0;
+
+    WMTRenderPipelineInfo info = { };
+    info.rasterization_enabled = true;
+    info.raster_sample_count = 1;
+    info.depth_pixel_format   = WMTPixelFormatDepth32Float_Stencil8;
+    info.stencil_pixel_format = WMTPixelFormatDepth32Float_Stencil8;
+    info.vertex_function = s_resolveVs;
+    info.fragment_function = withStencil ? s_resolveDsPs : s_resolveDPs;
+    info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
+    info.max_tessellation_factor = 16; // Metal default; 0 trips validation
+
+    obj_handle_t err = 0;
+    obj_handle_t pso = MTLDevice_newRenderPipelineState(mtlDevice(), &info, &err);
+    if (!pso) {
+      Logger::err("d9mt: depth resolve: newRenderPipelineState failed");
+      logNSError("d9mt: depth resolve PSO", err);
+      return 0;
+    }
+
+    cached = pso;
+    return pso;
+  }
+
+
+  // ==========================================================================
   // Blitter side state (gamma/cursor metadata + log-once flags). The
   // vendored members are Vulkan-resource-shaped; we only need a few bools.
   // Guarded by the blitter's own vendored m_mutex (per BACKEND-SURFACE §5.2).

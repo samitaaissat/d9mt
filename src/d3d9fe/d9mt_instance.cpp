@@ -212,6 +212,33 @@ namespace dxvk::d9mt {
 
 
   // ---------------------------------------------------------------------
+  // MSAA sample counts supported by the actual Metal device. M1-class
+  // Apple GPUs cap color/depth at 4x — advertising a fixed 1|2|4|8 mask
+  // over-promised 8x (CheckDeviceMultiSampleType would accept it and the
+  // first 8x render target creation would fail). Queried once via
+  // MTLDevice_supportsTextureSampleCount.
+  // ---------------------------------------------------------------------
+
+  VkSampleCountFlags supportedSampleCounts() {
+    static const VkSampleCountFlags s_counts = []() -> VkSampleCountFlags {
+      VkSampleCountFlags mask = VK_SAMPLE_COUNT_1_BIT;
+      obj_handle_t device = mtlDevice();
+      if (device) {
+        if (MTLDevice_supportsTextureSampleCount(device, 2u))
+          mask |= VK_SAMPLE_COUNT_2_BIT;
+        if (MTLDevice_supportsTextureSampleCount(device, 4u))
+          mask |= VK_SAMPLE_COUNT_4_BIT;
+        if (MTLDevice_supportsTextureSampleCount(device, 8u))
+          mask |= VK_SAMPLE_COUNT_8_BIT;
+      }
+      logf("d9mt: supported texture sample counts mask 0x%x", mask);
+      return mask;
+    }();
+    return s_counts;
+  }
+
+
+  // ---------------------------------------------------------------------
   // fake instance dispatch backing DxvkAdapter::vki().
   //
   // There is no Vulkan in this process; the ONLY instance-level entry point
@@ -532,8 +559,7 @@ namespace dxvk {
      && !(query.flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
      && (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT
                    | VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT))) {
-      limits.sampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT
-                          | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+      limits.sampleCounts = d9mt::supportedSampleCounts();
     }
 
     limits.maxResourceSize  = VkDeviceSize(1u) << 31;
@@ -688,8 +714,7 @@ namespace dxvk {
     limits.maxFramebufferWidth  = 16384u;
     limits.maxFramebufferHeight = 16384u;
     limits.maxFramebufferLayers = 2048u;
-    limits.framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT
-      | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+    limits.framebufferColorSampleCounts = d9mt::supportedSampleCounts();
     limits.framebufferDepthSampleCounts   = limits.framebufferColorSampleCounts;
     limits.framebufferStencilSampleCounts = limits.framebufferColorSampleCounts;
     limits.framebufferNoAttachmentsSampleCounts = limits.framebufferColorSampleCounts;

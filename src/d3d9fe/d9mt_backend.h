@@ -191,6 +191,11 @@ namespace dxvk::d9mt {
 
   obj_handle_t getBlitPso(WMTPixelFormat dstFormat, bool pointFilter = false);
 
+  // Depth(+stencil) SAMPLE_ZERO resolve PSO (d9mt_presenter.cpp): fullscreen
+  // triangle exporting [[depth(any)]] (+ [[stencil]]) read from sample 0 of
+  // an MSAA Depth32Float_Stencil8 source. Used by DxvkContext::resolveImage.
+  obj_handle_t getDepthResolvePso(bool withStencil);
+
   // -------------------------------------------------------------------------
   // completion watcher (d9mt_watcher.cpp) — the GPU-liveness backbone
   // (BACKEND-SURFACE §5.1). winemetal has no generic completion-callback

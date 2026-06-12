@@ -132,12 +132,24 @@ i686-w64-mingw32-gcc -O2 \
   "$ROOT/test/extest.c" \
   -ld3d9 -luser32 -lgdi32
 
-# depthtri reuses the shadertri bytecode headers
+echo "[build] compiling querytest.exe"
+i686-w64-mingw32-gcc -O2 \
+  -o "$BUILD/querytest.exe" \
+  "$ROOT/test/querytest.c" \
+  -ld3d9 -luser32 -lgdi32
+
+# depthtri + resolvetest reuse the shadertri bytecode headers
 if [[ -f "$BUILD/shadertri_vs_bytecode.h" ]]; then
   echo "[build] compiling depthtri.exe (reuses shadertri bytecode)"
   i686-w64-mingw32-gcc -O2 \
     -o "$BUILD/depthtri.exe" \
     "$ROOT/test/depthtri.c" \
+    -I "$BUILD" \
+    -ld3d9 -luser32 -lgdi32
+  echo "[build] compiling resolvetest.exe (reuses shadertri bytecode)"
+  i686-w64-mingw32-gcc -O2 \
+    -o "$BUILD/resolvetest.exe" \
+    "$ROOT/test/resolvetest.c" \
     -I "$BUILD" \
     -ld3d9 -luser32 -lgdi32
 fi

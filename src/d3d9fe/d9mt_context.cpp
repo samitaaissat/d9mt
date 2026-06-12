@@ -22,6 +22,8 @@
 #include <map>
 #include <unordered_map>
 
+#include <windows.h>
+
 #include "d9mt_backend.h"
 #include "d9mt_draw.h"
 
@@ -29,9 +31,59 @@
 #include "../../vendor/dxvk/src/dxvk/dxvk_context.h"
 #include "../../vendor/dxvk/src/dxvk/dxvk_device.h"
 #include "../../vendor/dxvk/src/dxvk/dxvk_gpu_event.h"
+#include "../../vendor/dxvk/src/dxvk/dxvk_gpu_query.h"
 #include "../../vendor/dxvk/src/dxvk/dxvk_staging.h"
 
 namespace dxvk::d9mt {
+
+  // ==========================================================================
+  // GPU-query result side state (Queries stage). Each DxvkGpuQuery pool token
+  // carries one result slot here: occlusion queries get the summed-up
+  // visibility-result value, timestamp queries the command buffer's GPU end
+  // time. Written by the watcher thread at submission retirement (value
+  // first, then state with release), polled by DxvkQuery::getData on the app
+  // thread (state acquire, then value) — results stay Pending until the
+  // submission containing the query really retired (BACKEND-SURFACE §5.3).
+  // Entries live for the pool-token lifetime (bounded by the allocator pool
+  // sizes) and are reset whenever the token is re-allocated on the CS thread.
+  // ==========================================================================
+
+  struct GpuQueryResult {
+    static constexpr uint32_t Pending   = 0u;
+    static constexpr uint32_t Available = 1u;
+    static constexpr uint32_t Failed    = 2u;
+
+    std::atomic<uint32_t> state = { Pending };
+    uint64_t              value = 0u;
+  };
+
+  GpuQueryResult& gpuQueryResult(const void* gpuQuery) {
+    static std::mutex s_mutex;
+    static std::unordered_map<const void*, std::unique_ptr<GpuQueryResult>> s_map;
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+    auto& slot = s_map[gpuQuery];
+    if (!slot)
+      slot = std::make_unique<GpuQueryResult>();
+    return *slot;
+  }
+
+  static void resetGpuQueryResult(const void* gpuQuery) {
+    auto& result = gpuQueryResult(gpuQuery);
+    result.value = 0u;
+    result.state.store(GpuQueryResult::Pending, std::memory_order_relaxed);
+  }
+
+  // Marks a query result failed unless it was already resolved. Used for
+  // command lists that get reset without ever being submitted, so pollers
+  // see Failed instead of hanging on Pending forever.
+  static void failGpuQueryResult(const void* gpuQuery) {
+    auto& result = gpuQueryResult(gpuQuery);
+    uint32_t expected = GpuQueryResult::Pending;
+    result.state.compare_exchange_strong(expected, GpuQueryResult::Failed,
+      std::memory_order_release, std::memory_order_relaxed);
+  }
+
 
   // ==========================================================================
   // Command-list side state: MTLCommandBuffer + encoder state machine.
@@ -60,11 +112,108 @@ namespace dxvk::d9mt {
     obj_handle_t lastRenderPso  = 0;
     obj_handle_t lastRenderDsso = 0;
     std::vector<obj_handle_t> renderResident;
+
+    // visibility-result state (occlusion queries): one pooled shared-storage
+    // MTLBuffer per submission that counts samples; slots are bump-allocated
+    // (one per GPU query, new GPU query per encoder restart while active)
+    // and summed up on the watcher thread at retirement
+    obj_handle_t visBuffer    = 0;            // retained (vis-buffer pool)
+    uint64_t*    visMem       = nullptr;      // VirtualAlloc'd, zeroed at acquire
+    uint32_t     visSlotsUsed = 0;
+    bool         visAttached  = false;        // open render encoder counts into visBuffer
+    std::vector<std::pair<Rc<DxvkGpuQuery>, uint32_t>> visSlots;
+
+    // timestamp queries resolved from the command buffer's GPU end time
+    std::vector<Rc<DxvkGpuQuery>> tsQueries;
   };
+
+  // 64 KiB of visibility-result slots per submission (one slot per active-
+  // occlusion-query encoder span, not per draw — generous for real apps).
+  constexpr uint32_t VisSlotCount  = 8192u;
+  constexpr size_t   VisBufferSize = size_t(VisSlotCount) * sizeof(uint64_t);
 
   namespace {
     std::mutex s_cmdListMutex;
     std::unordered_map<const void*, std::unique_ptr<CmdListState>> s_cmdListStates;
+
+    // recycling pool for visibility-result buffers (VirtualAlloc memory
+    // wrapped bytes-no-copy, same pattern as the sampler heap)
+    struct VisBuffer {
+      obj_handle_t buffer = 0;
+      void*        mem    = nullptr;
+    };
+    std::mutex s_visPoolMutex;
+    std::vector<VisBuffer> s_visPool;
+    constexpr size_t MaxPooledVisBuffers = 8;
+  }
+
+  // Attaches a (pooled) zeroed visibility-result buffer to the command list.
+  // Returns false on allocation failure (logged; occlusion queries then fail
+  // loudly through the Failed result state).
+  static bool acquireVisBuffer(CmdListState& state) {
+    if (state.visBuffer)
+      return true;
+
+    VisBuffer vb = { };
+    {
+      std::lock_guard<std::mutex> lock(s_visPoolMutex);
+      if (!s_visPool.empty()) {
+        vb = s_visPool.back();
+        s_visPool.pop_back();
+      }
+    }
+
+    if (!vb.buffer) {
+      void* mem = VirtualAlloc(nullptr, VisBufferSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+      obj_handle_t device = mtlDevice();
+
+      if (mem && device) {
+        WMTBufferInfo info = { };
+        info.length  = VisBufferSize;
+        info.options = WMTResourceStorageModeShared;
+        info.memory.set(mem);
+
+        vb.buffer = MTLDevice_newBuffer(device, &info);
+      }
+
+      if (!vb.buffer) {
+        logf("d9mt: visibility-result buffer creation failed (mem=%p dev=%llx)",
+          mem, (unsigned long long)device);
+        if (mem)
+          VirtualFree(mem, 0, MEM_RELEASE);
+        return false;
+      }
+      vb.mem = mem;
+    }
+
+    std::memset(vb.mem, 0, VisBufferSize);
+
+    state.visBuffer    = vb.buffer;
+    state.visMem       = reinterpret_cast<uint64_t*>(vb.mem);
+    state.visSlotsUsed = 0;
+    return true;
+  }
+
+  static void releaseVisBuffer(CmdListState& state) {
+    if (!state.visBuffer)
+      return;
+
+    VisBuffer vb = { state.visBuffer, state.visMem };
+    state.visBuffer    = 0;
+    state.visMem       = nullptr;
+    state.visSlotsUsed = 0;
+
+    {
+      std::lock_guard<std::mutex> lock(s_visPoolMutex);
+      if (s_visPool.size() < MaxPooledVisBuffers) {
+        s_visPool.push_back(vb);
+        return;
+      }
+    }
+
+    NSObject_release(vb.buffer);
+    VirtualFree(vb.mem, 0, MEM_RELEASE);
   }
 
   static CmdListState& cmdListState(const void* list) {
@@ -82,6 +231,7 @@ namespace dxvk::d9mt {
       state.encoder = 0;
       state.kind = EncoderKind::None;
     }
+    state.visAttached = false;
   }
 
   static void resetCmdListState(const void* list) {
@@ -103,6 +253,18 @@ namespace dxvk::d9mt {
     }
 
     state->onComplete.clear();
+
+    // queries on a list that never got submitted (reset without commit) must
+    // not stay Pending forever — pollers spin on GetData
+    for (const auto& entry : state->visSlots)
+      failGpuQueryResult(entry.first.ptr());
+    state->visSlots.clear();
+
+    for (const auto& query : state->tsQueries)
+      failGpuQueryResult(query.ptr());
+    state->tsQueries.clear();
+
+    releaseVisBuffer(*state);
   }
 
   static obj_handle_t ensureCmdBuf(CmdListState& state) {
@@ -215,9 +377,44 @@ namespace dxvk::d9mt {
     return state.cmdbuf;
   }
 
-  // Runs per-submission completion work; called on the watcher thread.
+  namespace {
+    // Last resolved GPU timestamp (ns). Only the watcher thread writes it;
+    // keeps timestamps monotonic across command buffers (GPU end times of
+    // separately committed buffers are not strictly ordered by Metal).
+    std::atomic<uint64_t> s_lastGpuTimestamp = { 0u };
+  }
+
+  // Runs per-submission completion work; called on the watcher thread after
+  // the submission's command buffer retired (or immediately, in retirement
+  // order, for empty submissions).
   static void cmdListRunCompletionWork(const void* list) {
     auto& state = cmdListState(list);
+
+    // occlusion queries: each GPU query owns one visibility-result slot the
+    // GPU has now written; publish value-then-state (release) for getData
+    for (const auto& entry : state.visSlots) {
+      auto& result = gpuQueryResult(entry.first.ptr());
+      result.value = state.visMem ? state.visMem[entry.second] : 0u;
+      result.state.store(GpuQueryResult::Available, std::memory_order_release);
+    }
+    state.visSlots.clear();
+
+    // timestamp queries: command buffer GPU end time in ns
+    // (timestampPeriod = 1.0), kept monotonic across submissions
+    if (!state.tsQueries.empty()) {
+      uint64_t time = state.cmdbuf
+        ? MTLCommandBuffer_property(state.cmdbuf, WMTCommandBufferPropertyGPUEndTime)
+        : 0u;
+      time = std::max(time, s_lastGpuTimestamp.load(std::memory_order_relaxed));
+      s_lastGpuTimestamp.store(time, std::memory_order_relaxed);
+
+      for (const auto& query : state.tsQueries) {
+        auto& result = gpuQueryResult(query.ptr());
+        result.value = time;
+        result.state.store(GpuQueryResult::Available, std::memory_order_release);
+      }
+      state.tsQueries.clear();
+    }
 
     for (const auto& fn : state.onComplete)
       fn();
@@ -696,6 +893,41 @@ namespace dxvk::d9mt {
   }
 
 
+  // DSSO for the depth(+stencil) SAMPLE_ZERO resolve pass (resolveImage):
+  // unconditional depth write; the stencil variant relies on shader stencil
+  // export ([[stencil]] replaces the reference value) + op Replace.
+  static obj_handle_t getDepthResolveDsso(bool withStencil) {
+    static obj_handle_t s_resolveDsso[2] = { };
+
+    std::lock_guard<std::mutex> lock(s_dssoMutex);
+
+    obj_handle_t& cached = s_resolveDsso[withStencil ? 1 : 0];
+    if (cached)
+      return cached;
+
+    WMTDepthStencilInfo info = { };
+    info.depth_compare_function = WMTCompareFunctionAlways;
+    info.depth_write_enabled = true;
+
+    if (withStencil) {
+      for (auto* s : { &info.front_stencil, &info.back_stencil }) {
+        s->enabled = true;
+        s->depth_stencil_pass_op    = WMTStencilOperationReplace;
+        s->stencil_fail_op          = WMTStencilOperationKeep;
+        s->depth_fail_op            = WMTStencilOperationKeep;
+        s->stencil_compare_function = WMTCompareFunctionAlways;
+        s->write_mask = 0xffu;
+        s->read_mask  = 0xffu;
+      }
+    }
+
+    cached = MTLDevice_newDepthStencilState(mtlDevice(), &info);
+    if (!cached)
+      Logger::err("d9mt: depth resolve: newDepthStencilState failed");
+    return cached;
+  }
+
+
   // --------------------------------------------------------------------------
   // per-context draw state (single CS-thread consumer; the map itself is
   // mutex-guarded like the other side tables)
@@ -710,6 +942,10 @@ namespace dxvk::d9mt {
     bool                fbHasDepth = false;
     VkImageAspectFlags  fbReadOnlyAspects = 0;
     uint32_t            fbLayerCount = 1u;
+
+    // occlusion queries currently inside begin/end (Queries stage): render
+    // passes attach a visibility-result buffer while this is non-zero
+    uint32_t            activeOcclusionCount = 0u;
 
     const PsoEntry*     pso = nullptr;
   };
@@ -1049,8 +1285,20 @@ namespace dxvk {
 
 
   // ==========================================================================
-  // DxvkGpuQueryManager — per-context query bookkeeping shell; the
-  // begin/end/writeTimestamp logic is the Queries stage.
+  // DxvkGpuQueryManager — upstream bookkeeping (active virtual queries per
+  // type, one shared GPU query per active span) over Metal visibility-result
+  // slots instead of VkQueryPools. A GPU query == one visibility slot in the
+  // current command list's buffer; "ending" it needs no Metal command (the
+  // slot is final once the encoder ends or the mode changes), and queries
+  // spanning encoder restarts simply accumulate additional GPU queries on
+  // the virtual DxvkQuery (BACKEND-SURFACE §5.3 / §7 risk 4).
+  //
+  // beginQueries/endQueries are driven by the context's render-pass
+  // lifecycle (startRenderPass / spillRenderPass / updateRenderTargets).
+  // Encoders that die behind the manager's back (encoder-kind switches in
+  // copy paths) are safe: restartQueries only encodes into a live render
+  // encoder with an attached visibility buffer, and the next startRenderPass
+  // restarts every active query with a fresh slot.
   // ==========================================================================
 
   DxvkGpuQueryManager::DxvkGpuQueryManager(DxvkGpuQueryPool& pool)
@@ -1061,6 +1309,178 @@ namespace dxvk {
 
   DxvkGpuQueryManager::~DxvkGpuQueryManager() {
 
+  }
+
+
+  void DxvkGpuQueryManager::enableQuery(
+    const Rc<DxvkCommandList>&  cmd,
+    const Rc<DxvkQuery>&        query) {
+    query->begin();
+
+    uint32_t index = getQueryTypeIndex(query->type(), query->index());
+
+    m_activeQueries[index].queries.push_back(query);
+
+    if (m_activeTypes & getQueryTypeBit(query->type()))
+      restartQueries(cmd, query->type(), query->index());
+  }
+
+
+  void DxvkGpuQueryManager::disableQuery(
+    const Rc<DxvkCommandList>&  cmd,
+    const Rc<DxvkQuery>&        query) {
+    uint32_t index = getQueryTypeIndex(query->type(), query->index());
+
+    for (auto& q : m_activeQueries[index].queries) {
+      if (q == query) {
+        q = std::move(m_activeQueries[index].queries.back());
+        m_activeQueries[index].queries.pop_back();
+        break;
+      }
+    }
+
+    if (m_activeTypes & getQueryTypeBit(query->type()))
+      restartQueries(cmd, query->type(), query->index());
+
+    query->end();
+  }
+
+
+  void DxvkGpuQueryManager::writeTimestamp(
+    const Rc<DxvkCommandList>&  cmd,
+    const Rc<DxvkQuery>&        query) {
+    Rc<DxvkGpuQuery> q = m_pool->allocQuery(query->type());
+
+    if (q == nullptr) {
+      Logger::err("d9mt: writeTimestamp: failed to allocate GPU query");
+      return;
+    }
+
+    d9mt::resetGpuQueryResult(q.ptr());
+
+    query->begin();
+    query->addGpuQuery(q);
+    query->end();
+
+    // make sure the submission carries a real command buffer so the
+    // resolved GPU end time is meaningful (empty submissions fall back to
+    // the last resolved timestamp)
+    auto& state = d9mt::cmdListState(cmd.ptr());
+    d9mt::ensureCmdBuf(state);
+
+    state.tsQueries.push_back(std::move(q));
+  }
+
+
+  void DxvkGpuQueryManager::beginQueries(
+    const Rc<DxvkCommandList>&  cmd,
+          VkQueryType           type) {
+    m_activeTypes |= getQueryTypeBit(type);
+
+    restartQueries(cmd, type, 0);
+  }
+
+
+  void DxvkGpuQueryManager::endQueries(
+    const Rc<DxvkCommandList>&  cmd,
+          VkQueryType           type) {
+    m_activeTypes &= ~getQueryTypeBit(type);
+
+    restartQueries(cmd, type, 0);
+  }
+
+
+  void DxvkGpuQueryManager::restartQueries(
+    const Rc<DxvkCommandList>&  cmd,
+          VkQueryType           type,
+          uint32_t              index) {
+    if (type != VK_QUERY_TYPE_OCCLUSION) {
+      Logger::err(str::format("d9mt: GpuQueryManager: unsupported query type ",
+        uint32_t(type)));
+      return;
+    }
+
+    auto& array = m_activeQueries[getQueryTypeIndex(type, index)];
+    auto& state = d9mt::cmdListState(cmd.ptr());
+
+    // Ending the current GPU query needs no Metal command: its slot value is
+    // final once the encoder stops counting into it (mode change below or
+    // encoder end).
+    bool hadQuery = array.gpuQuery != nullptr;
+    array.gpuQuery = nullptr;
+
+    bool encoderReady = state.kind == d9mt::EncoderKind::Render
+                     && state.encoder
+                     && state.visAttached;
+
+    if ((m_activeTypes & getQueryTypeBit(type)) && !array.queries.empty()) {
+      // Outside a visibility-enabled render encoder nothing can be counted;
+      // the next startRenderPass restarts active queries with a fresh slot.
+      if (!encoderReady)
+        return;
+
+      Rc<DxvkGpuQuery> q = m_pool->allocQuery(type);
+      auto& result = d9mt::gpuQueryResult(q.ptr());
+
+      if (state.visSlotsUsed >= d9mt::VisSlotCount) {
+        static bool s_logged = false;
+        if (!std::exchange(s_logged, true))
+          Logger::err("d9mt: visibility-result slots exhausted; occlusion query failed");
+
+        result.value = 0u;
+        result.state.store(d9mt::GpuQueryResult::Failed, std::memory_order_release);
+
+        // stop counting into the previous (already ended) slot
+        wmtcmd_render_setvisibilitymode mode = { };
+        mode.type = WMTRenderCommandSetVisibilityMode;
+        mode.mode = WMTVisibilityResultModeDisabled;
+        d9mt::encodeRenderCmd(state, &mode);
+      } else {
+        uint32_t slot = state.visSlotsUsed++;
+
+        result.value = 0u;
+        result.state.store(d9mt::GpuQueryResult::Pending, std::memory_order_relaxed);
+        state.visSlots.push_back({ q, slot });
+
+        // Metal visibility counting is always per-sample exact, which
+        // satisfies VK_QUERY_CONTROL_PRECISE_BIT for every active query
+        wmtcmd_render_setvisibilitymode mode = { };
+        mode.type = WMTRenderCommandSetVisibilityMode;
+        mode.offset = uint64_t(slot) * sizeof(uint64_t);
+        mode.mode = WMTVisibilityResultModeCounting;
+        d9mt::encodeRenderCmd(state, &mode);
+      }
+
+      for (const auto& vq : array.queries)
+        vq->addGpuQuery(q);
+
+      array.gpuQuery = std::move(q);
+    } else if (hadQuery && encoderReady) {
+      // active set went empty mid-encoder: stop counting so later draws do
+      // not corrupt the ended query's slot
+      wmtcmd_render_setvisibilitymode mode = { };
+      mode.type = WMTRenderCommandSetVisibilityMode;
+      mode.mode = WMTVisibilityResultModeDisabled;
+      d9mt::encodeRenderCmd(state, &mode);
+    }
+  }
+
+
+  uint32_t DxvkGpuQueryManager::getQueryTypeBit(
+          VkQueryType           type) {
+    return 1u << getQueryTypeIndex(type, 0u);
+  }
+
+
+  uint32_t DxvkGpuQueryManager::getQueryTypeIndex(
+          VkQueryType           type,
+          uint32_t              index) {
+    switch (type) {
+      case VK_QUERY_TYPE_OCCLUSION:                     return 0u;
+      case VK_QUERY_TYPE_PIPELINE_STATISTICS:           return 1u;
+      case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: return 2u + index;
+      default:                                          return 0u;
+    }
   }
 
 
@@ -1126,6 +1546,100 @@ namespace dxvk {
       case VK_EVENT_RESET: return DxvkGpuEventStatus::Pending;
       default:             return DxvkGpuEventStatus::Invalid;
     }
+  }
+
+
+  // ==========================================================================
+  // DxvkQuery::getData — upstream v2.7.1 structure, with the per-GPU-query
+  // readback going through the d9mt result side state (resolved on the
+  // watcher thread at submission retirement) instead of
+  // vkGetQueryPoolResults. Polled non-blocking from the app thread.
+  // ==========================================================================
+
+  DxvkGpuQueryStatus DxvkQuery::getData(DxvkQueryData& queryData) {
+    queryData = DxvkQueryData();
+
+    // Callers must ensure that no begin call is pending when
+    // calling this. Given that, once the query is ended, we
+    // know that no other thread will access query state.
+    std::lock_guard<sync::Spinlock> lock(m_mutex);
+
+    if (!m_ended)
+      return DxvkGpuQueryStatus::Invalid;
+
+    // Accumulate query data from all available queries
+    DxvkGpuQueryStatus status = accumulateQueryDataLocked();
+
+    // Treat non-precise occlusion queries as available
+    // if we already know the result will be non-zero
+    if ((status == DxvkGpuQueryStatus::Pending)
+     && (m_type == VK_QUERY_TYPE_OCCLUSION)
+     && !(m_flags & VK_QUERY_CONTROL_PRECISE_BIT)
+     && (m_queryData.occlusion.samplesPassed))
+      status = DxvkGpuQueryStatus::Available;
+
+    // Write back accumulated query data if the result is useful
+    if (status == DxvkGpuQueryStatus::Available)
+      queryData = m_queryData;
+
+    return status;
+  }
+
+
+  DxvkGpuQueryStatus DxvkQuery::accumulateQueryDataForGpuQueryLocked(
+    const Rc<DxvkGpuQuery>&           query) {
+    const auto& result = d9mt::gpuQueryResult(query.ptr());
+
+    uint32_t state = result.state.load(std::memory_order_acquire);
+
+    if (state == d9mt::GpuQueryResult::Pending)
+      return DxvkGpuQueryStatus::Pending;
+    if (state == d9mt::GpuQueryResult::Failed)
+      return DxvkGpuQueryStatus::Failed;
+
+    switch (m_type) {
+      case VK_QUERY_TYPE_OCCLUSION:
+        m_queryData.occlusion.samplesPassed += result.value;
+        break;
+
+      case VK_QUERY_TYPE_TIMESTAMP:
+        m_queryData.timestamp.time = result.value;
+        break;
+
+      default:
+        Logger::err(str::format("d9mt: DxvkQuery: unhandled query type ",
+          uint32_t(m_type)));
+        return DxvkGpuQueryStatus::Invalid;
+    }
+
+    return DxvkGpuQueryStatus::Available;
+  }
+
+
+  DxvkGpuQueryStatus DxvkQuery::accumulateQueryDataLocked() {
+    DxvkGpuQueryStatus status = DxvkGpuQueryStatus::Available;
+
+    // Process available queries and release them
+    // if possible to keep the in-flight count low.
+    size_t queriesAvailable = 0;
+
+    while (queriesAvailable < m_queries.size()) {
+      status = accumulateQueryDataForGpuQueryLocked(m_queries[queriesAvailable]);
+
+      if (status != DxvkGpuQueryStatus::Available)
+        break;
+
+      queriesAvailable += 1;
+    }
+
+    if (queriesAvailable) {
+      for (size_t i = queriesAvailable; i < m_queries.size(); i++)
+        m_queries[i - queriesAvailable] = m_queries[i];
+
+      m_queries.resize(m_queries.size() - queriesAvailable);
+    }
+
+    return status;
   }
 
 
@@ -1332,6 +1846,10 @@ namespace dxvk {
     // Execute pending deferred clears and close the render encoder.
     if (!m_deferredClears.empty())
       this->flushClears(false);
+
+    // occlusion queries: end the current GPU-query span (bookkeeping only;
+    // the visibility slot is final once the encoder ends below)
+    m_queryManager.endQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
 
     auto& state = d9mt::cmdListState(m_cmd.ptr());
     if (state.kind == d9mt::EncoderKind::Render)
@@ -2552,15 +3070,6 @@ namespace dxvk {
     this->prepareImage(dstImage, vk::makeSubresourceRange(region.dstSubresource));
     this->prepareImage(srcImage, vk::makeSubresourceRange(region.srcSubresource));
 
-    if (region.srcSubresource.aspectMask
-      & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-      static bool s_warnedDepth = false;
-      if (!std::exchange(s_warnedDepth, true))
-        Logger::err("d9mt: resolveImage: depth-stencil resolve not implemented "
-          "(winemetal depth attachments have no resolve target)");
-      return;
-    }
-
     VkExtent3D srcExtent = srcImage->mipLevelExtent(region.srcSubresource.mipLevel);
 
     if (region.srcOffset != VkOffset3D { 0, 0, 0 }
@@ -2569,6 +3078,14 @@ namespace dxvk {
       static bool s_warnedPartial = false;
       if (!std::exchange(s_warnedPartial, true))
         Logger::err("d9mt: resolveImage: partial resolve not implemented");
+      return;
+    }
+
+    if (region.srcSubresource.aspectMask
+      & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+      // upstream's framebuffer-resolve helper slot doubles as our
+      // sample-pass depth-stencil resolve (declared in the vendored header)
+      this->resolveImageFb(dstImage, srcImage, region, format, mode, stencilMode);
       return;
     }
 
@@ -2606,28 +3123,237 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::resolveImageFb(
+    const Rc<DxvkImage>&            dstImage,
+    const Rc<DxvkImage>&            srcImage,
+    const VkImageResolve&           region,
+          VkFormat                  format,
+          VkResolveModeFlagBits     depthMode,
+          VkResolveModeFlagBits     stencilMode) {
+    // Depth(-stencil) SAMPLE_ZERO resolve (BACKEND-SURFACE §1.4; the
+    // GTA IV ResolveZ / INTZ path): winemetal depth attachments expose no
+    // resolve target, so this is a fullscreen-triangle pass over the 1x
+    // destination's depth/stencil attachments whose fragment shader exports
+    // [[depth(any)]] (+ [[stencil]]) read from sample 0 of the MSAA source.
+    // AVERAGE depth is performed as SAMPLE_ZERO — which is the documented
+    // d3d9 resolve semantic anyway ("the resolve operation copies the depth
+    // value from the first sample only", AMD Advanced DX9 Capabilities).
+    // Caller (resolveImage) already spilled the render pass, prepared both
+    // images and rejected partial regions.
+    VkImageAspectFlags aspects = region.srcSubresource.aspectMask;
+
+    bool resolveDepth = (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+      && depthMode != VK_RESOLVE_MODE_NONE;
+    bool resolveStencil = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+      && stencilMode != VK_RESOLVE_MODE_NONE;
+
+    if (!resolveDepth && !resolveStencil)
+      return;
+
+    if (!resolveDepth) {
+      // both shader variants export depth; no d3d9 call site resolves
+      // stencil alone (modes per BACKEND-SURFACE §1.4)
+      Logger::err("d9mt: resolveImage: stencil-only resolve not implemented");
+      return;
+    }
+
+    const auto* srcCaps = d9mt::lookupFormatCaps(srcImage->info().format);
+    const auto* dstCaps = d9mt::lookupFormatCaps(dstImage->info().format);
+
+    if (!srcCaps || !dstCaps
+     || srcCaps->wmtFormat != WMTPixelFormatDepth32Float_Stencil8
+     || dstCaps->wmtFormat != WMTPixelFormatDepth32Float_Stencil8) {
+      Logger::err(str::format("d9mt: resolveImage: unexpected depth formats (src ",
+        uint32_t(srcImage->info().format), ", dst ", uint32_t(dstImage->info().format), ")"));
+      return;
+    }
+
+    if (resolveDepth && depthMode != VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) {
+      // not a deviation worth a warn: native d3d9 depth resolves copy the
+      // first sample only (upstream picks AVERAGE on this path for Vulkan
+      // driver-support reasons that do not apply here)
+      static bool s_loggedAvg = false;
+      if (!std::exchange(s_loggedAvg, true))
+        Logger::info("d9mt: resolveImage: AVERAGE depth resolve performed as SAMPLE_ZERO");
+    }
+
+    obj_handle_t pso = d9mt::getDepthResolvePso(resolveStencil);
+    obj_handle_t dsso = d9mt::getDepthResolveDsso(resolveStencil);
+
+    if (!pso || !dsso)
+      return;
+
+    VkExtent3D dstExtent = dstImage->mipLevelExtent(region.dstSubresource.mipLevel);
+
+    for (uint32_t layer = 0; layer < region.dstSubresource.layerCount; layer++) {
+      // sample-0 source views (cached on the image's allocation; kept alive
+      // by the source image's command-list tracking below)
+      DxvkImageViewKey srcKey = { };
+      srcKey.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+      srcKey.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
+      srcKey.format     = srcImage->info().format;
+      srcKey.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+      srcKey.aspects    = VK_IMAGE_ASPECT_DEPTH_BIT;
+      srcKey.mipIndex   = uint8_t(region.srcSubresource.mipLevel);
+      srcKey.mipCount   = 1u;
+      srcKey.layerIndex = uint16_t(region.srcSubresource.baseArrayLayer + layer);
+      srcKey.layerCount = 1u;
+
+      Rc<DxvkImageView> srcDepthView = srcImage->createView(srcKey);
+      obj_handle_t srcDepthHandle = srcDepthView != nullptr
+        ? obj_handle_t(srcDepthView->handle()) : 0u;
+
+      obj_handle_t srcStencilHandle = 0u;
+
+      if (resolveStencil) {
+        srcKey.aspects = VK_IMAGE_ASPECT_STENCIL_BIT; // → X32_Stencil8 alias
+        Rc<DxvkImageView> srcStencilView = srcImage->createView(srcKey);
+        srcStencilHandle = srcStencilView != nullptr
+          ? obj_handle_t(srcStencilView->handle()) : 0u;
+      }
+
+      if (!srcDepthHandle || (resolveStencil && !srcStencilHandle)) {
+        Logger::err("d9mt: resolveImage: failed to create depth resolve source views");
+        return;
+      }
+
+      WMTRenderPassInfo pass = { };
+      pass.render_target_width  = dstExtent.width;
+      pass.render_target_height = dstExtent.height;
+
+      // unified-DS rule: both planes always attached (Depth32Float_Stencil8);
+      // the aspect we do not resolve is loaded and stored unchanged
+      pass.depth.texture = obj_handle_t(dstImage->handle());
+      pass.depth.level = uint16_t(region.dstSubresource.mipLevel);
+      pass.depth.slice = uint16_t(region.dstSubresource.baseArrayLayer + layer);
+      pass.depth.load_action  = WMTLoadActionDontCare; // fully overwritten
+      pass.depth.store_action = WMTStoreActionStore;
+
+      pass.stencil.texture = pass.depth.texture;
+      pass.stencil.level = pass.depth.level;
+      pass.stencil.slice = pass.depth.slice;
+      pass.stencil.load_action  = resolveStencil ? WMTLoadActionDontCare : WMTLoadActionLoad;
+      pass.stencil.store_action = WMTStoreActionStore;
+
+      obj_handle_t enc = d9mt::cmdListBeginRenderPass(m_cmd.ptr(), pass);
+      if (!enc)
+        return;
+
+      wmtcmd_render_setpso setPso = { };
+      wmtcmd_render_setdsso setDsso = { };
+      wmtcmd_render_setviewport setVp = { };
+      wmtcmd_render_useresource useDepth = { };
+      wmtcmd_render_useresource useStencil = { };
+      wmtcmd_render_settexture setTexDepth = { };
+      wmtcmd_render_settexture setTexStencil = { };
+      wmtcmd_render_draw drawCmd = { };
+
+      setPso.type = WMTRenderCommandSetPSO;
+      setPso.next.set(&setDsso);
+      setPso.pso = pso;
+
+      setDsso.type = WMTRenderCommandSetDSSO;
+      setDsso.next.set(&setVp);
+      setDsso.dsso = dsso;
+      setDsso.stencil_ref = 0u; // replaced per-fragment by [[stencil]] export
+
+      setVp.type = WMTRenderCommandSetViewport;
+      setVp.next.set(&useDepth);
+      setVp.viewport = { 0.0, 0.0,
+                         double(dstExtent.width), double(dstExtent.height), 0.0, 1.0 };
+
+      useDepth.type = WMTRenderCommandUseResource;
+      useDepth.next.set(&setTexDepth);
+      useDepth.resource = srcDepthHandle;
+      useDepth.usage = WMTResourceUsageRead;
+      useDepth.stages = WMTRenderStages(WMTRenderStageFragment);
+
+      setTexDepth.type = WMTRenderCommandSetFragmentTexture;
+      setTexDepth.texture = srcDepthHandle;
+      setTexDepth.index = 0;
+
+      if (resolveStencil) {
+        setTexDepth.next.set(&useStencil);
+
+        useStencil.type = WMTRenderCommandUseResource;
+        useStencil.next.set(&setTexStencil);
+        useStencil.resource = srcStencilHandle;
+        useStencil.usage = WMTResourceUsageRead;
+        useStencil.stages = WMTRenderStages(WMTRenderStageFragment);
+
+        setTexStencil.type = WMTRenderCommandSetFragmentTexture;
+        setTexStencil.next.set(&drawCmd);
+        setTexStencil.texture = srcStencilHandle;
+        setTexStencil.index = 1;
+      } else {
+        setTexDepth.next.set(&drawCmd);
+      }
+
+      drawCmd.type = WMTRenderCommandDraw;
+      drawCmd.primitive_type = WMTPrimitiveTypeTriangle;
+      drawCmd.vertex_start = 0;
+      drawCmd.vertex_count = 3;
+      drawCmd.instance_count = 1;
+      drawCmd.base_instance = 0;
+
+      MTLRenderCommandEncoder_encodeCommands(enc,
+        reinterpret_cast<const wmtcmd_base*>(&setPso));
+
+      d9mt::cmdListEndEncoder(m_cmd.ptr());
+    }
+
+    m_cmd->track(dstImage, DxvkAccess::Write);
+    m_cmd->track(srcImage, DxvkAccess::Read);
+  }
+
+
   // --------------------------------------------------------------------------
   // queries / events
   // --------------------------------------------------------------------------
 
   void DxvkContext::beginQuery(const Rc<DxvkQuery>& query) {
-    static bool s_logged = false;
-    if (!std::exchange(s_logged, true))
-      Logger::err("d9mt: beginQuery: occlusion queries need the Queries stage (visibility buffer)");
+    if (query->type() != VK_QUERY_TYPE_OCCLUSION) {
+      Logger::err(str::format("d9mt: beginQuery: unsupported query type ",
+        uint32_t(query->type())));
+      return;
+    }
+
+    // A pass that started without a visibility-result buffer cannot count
+    // samples: split it, so the next draw restarts the pass with the buffer
+    // attached and the query restarted into a fresh slot.
+    auto& cstate = d9mt::cmdListState(m_cmd.ptr());
+    if (cstate.kind == d9mt::EncoderKind::Render && !cstate.visAttached)
+      this->spillRenderPass(true);
+
+    d9mt::ctxDrawStateImpl(this).activeOcclusionCount += 1u;
+
+    m_queryManager.enableQuery(m_cmd, query);
   }
 
 
   void DxvkContext::endQuery(const Rc<DxvkQuery>& query) {
-    static bool s_logged = false;
-    if (!std::exchange(s_logged, true))
-      Logger::err("d9mt: endQuery: occlusion queries need the Queries stage (visibility buffer)");
+    if (query->type() != VK_QUERY_TYPE_OCCLUSION) {
+      Logger::err(str::format("d9mt: endQuery: unsupported query type ",
+        uint32_t(query->type())));
+      return;
+    }
+
+    auto& dstate = d9mt::ctxDrawStateImpl(this);
+    if (dstate.activeOcclusionCount)
+      dstate.activeOcclusionCount -= 1u;
+
+    m_queryManager.disableQuery(m_cmd, query);
   }
 
 
   void DxvkContext::writeTimestamp(const Rc<DxvkQuery>& query) {
-    static bool s_logged = false;
-    if (!std::exchange(s_logged, true))
-      Logger::err("d9mt: writeTimestamp: timestamp queries need the Queries stage");
+    if (query->type() != VK_QUERY_TYPE_TIMESTAMP) {
+      Logger::err(str::format("d9mt: writeTimestamp: unsupported query type ",
+        uint32_t(query->type())));
+      return;
+    }
+
+    m_queryManager.writeTimestamp(m_cmd, query);
   }
 
 
@@ -2905,8 +3631,10 @@ namespace dxvk {
     auto& cstate = d9mt::cmdListState(m_cmd.ptr());
 
     // end the current pass; pending clears get handled at startRenderPass
-    if (cstate.kind == d9mt::EncoderKind::Render)
+    if (cstate.kind == d9mt::EncoderKind::Render) {
+      m_queryManager.endQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
       d9mt::endEncoder(cstate);
+    }
 
     m_flags.clr(DxvkContextFlag::GpRenderPassBound);
 
@@ -3046,6 +3774,19 @@ namespace dxvk {
     if (dstate.fbLayerCount > 1u)
       pass.render_target_array_length = uint8_t(dstate.fbLayerCount);
 
+    // occlusion queries inside begin/end need a visibility-result buffer on
+    // the pass descriptor (it can only be attached at pass creation)
+    if (dstate.activeOcclusionCount) {
+      auto& cstate = d9mt::cmdListState(m_cmd.ptr());
+      if (d9mt::acquireVisBuffer(cstate)) {
+        pass.visibility_buffer = cstate.visBuffer;
+      } else {
+        static bool s_logged = false;
+        if (!std::exchange(s_logged, true))
+          Logger::err("d9mt: startRenderPass: no visibility-result buffer; occlusion queries will not count");
+      }
+    }
+
     bool valid = true;
 
     for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
@@ -3142,6 +3883,11 @@ namespace dxvk {
     cstate.lastRenderPso  = 0;
     cstate.lastRenderDsso = 0;
     cstate.renderResident.clear();
+
+    // restart active occlusion queries into a fresh visibility slot of the
+    // new encoder (queries span pass splits by accumulating GPU queries)
+    cstate.visAttached = pass.visibility_buffer != 0;
+    m_queryManager.beginQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
 
     m_flags.set(DxvkContextFlag::GpRenderPassBound);
 

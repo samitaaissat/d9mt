@@ -102,7 +102,9 @@ Properties: deviceName "Apple M1 Max (d9mt)", vendor/device 0x106b/0xa1,
 apiVersion 1.3, timestampPeriod 1.0, maxUniformBufferRange 65536,
 minUniformBufferOffsetAlignment 256, minStorageBufferOffsetAlignment 16,
 maxPushConstantsSize 256, maxColorAttachments 8 (d3d9 uses 4),
-framebufferColor/DepthSampleCounts 1|2|4|8, pointSizeRange {1,511},
+framebufferColor/DepthSampleCounts queried from the device at runtime
+(d9mt::supportedSampleCounts(), MTLDevice_supportsTextureSampleCount;
+1|2|4 on M1-class GPUs — 8x is NOT advertised), pointSizeRange {1,511},
 maxSamplerAnisotropy 16, maxImageDimension2D/Cube 16384, 3D 2048,
 maxVertexInputAttributes/Bindings 32, maxViewports 16.
 Memory: heap0 DEVICE_LOCAL 3 GiB (GetAvailableTextureMem budget match);
@@ -128,7 +130,8 @@ Queues: graphics=transfer=family 0 index 0; sparse VK_QUEUE_FAMILY_IGNORED.
 - `d9mt_watcher.cpp` — completion watcher thread (liveness backbone).
 - `d9mt_presenter.cpp` — Presenter (CAMetalLayer via winemetal),
   DxvkSwapchainBlitter.
-- `d9mt_queries.cpp` — DxvkQuery/DxvkEvent/pools.
+- (queries live in d9mt_context.cpp — getData/manager/visibility slots — and
+  d9mt_device.cpp — alloc/recycle pools; no separate d9mt_queries.cpp.)
 Stubs remain in stubs.cpp for anything not yet implemented; REMOVE a
 symbol from stubs.cpp when implementing it (duplicate symbol = link error
 tells you exactly what moved).
@@ -177,10 +180,11 @@ tells you exactly what moved).
    - UINT alias formats R32G32_UINT / R32G32B32A32_UINT included for the
      BC-block clearImageView path.
 7. **getFormatLimits**: rejects shared-handle queries (Logger::err +
-   nullopt); MSAA counts 1|2|4|8 only for 2D/OPTIMAL/non-cube formats
-   with attachment features. NOTE the caps table advertises 8x but M1
-   Metal caps color samples at 4 — revisit when MSAA RTs are actually
-   created (CheckDeviceMultiSampleType may over-promise 8x).
+   nullopt); MSAA counts = d9mt::supportedSampleCounts() (runtime
+   MTLDevice_supportsTextureSampleCount query, cached; 1|2|4 on M1) only
+   for 2D/OPTIMAL/non-cube formats with attachment features. The earlier
+   fixed 1|2|4|8 mask over-promised 8x on M1 — fixed; resolvetest.exe
+   asserts CheckDeviceMultiSampleType(8x) and 8x RT creation agree.
 8. **DxvkDeviceCapabilities ctor** fills everything per the caps table
    above; additionally vk13 dynamicRendering/synchronization2/
    maintenance4 = true (DXVK baseline, read nowhere in d3d9),
@@ -255,8 +259,13 @@ tells you exactly what moved).
     d9mt::samplerHeapData()[index] (2048-entry u64 shadow array == set-15
     sampler heap, uploaded by the Draw stage); dtor zeroes the slot +
     releases. Border colors snap to Metal's 3 fixed colors (nearest by
-    L2 distance); **sampler LOD bias is DROPPED** (no Metal equivalent;
-    known visual deviation — shader-level bias would be a Draw-stage fix).
+    L2 distance); **sampler LOD bias is DROPPED** (RE-VERIFIED at the
+    backlog pass: WMTSamplerInfo exposes only lod_min_clamp/lod_max_clamp/
+    lod_average — no bias field, and MTLSamplerDescriptor itself has no
+    LOD-bias property, so winemetal cannot grow one. Permanent documented
+    deviation for D3DSAMP_MIPMAPLODBIAS; the only faithful fix would be
+    shader-level `bias()` at sample sites keyed on the bound sampler,
+    i.e. a Draw-stage spec-constant/PSO-key change — out of scope).
     VkCompareOp values map 1:1 onto WMTCompareFunction. Pool exhaustion
     returns nullptr after Logger::err (front-end EnsureSamplerLimit spins
     on getStats().liveCount before that can happen).
@@ -273,8 +282,8 @@ tells you exactly what moved).
     video formats the adapter reports unsupported ⇒ unreachable).
 13. **GpuEventPool/GpuQueryPool**: real alloc/recycle machinery (free-list
     pools, fake u64 query-pool cookies so (pool,index) pairs stay unique);
-    VkEvent/VkQueryPool handles stay null — completion is watcher-based
-    (Queries stage). DxvkQuery::getData / DxvkEvent::test remain stubs.
+    VkEvent/VkQueryPool handles stay null — completion is watcher-based.
+    DxvkQuery::getData / DxvkEvent::test are real now (Queries stage).
 14. **UnboundResources**: ctor/dtor only; nullDescriptor=true means the
     dummies are unreachable until Resources stage.
 15. **DxvkCommandList/DxvkContext**: full ctor cascade so createContext()/
@@ -451,9 +460,8 @@ tells you exactly what moved).
 13. **EVENT queries work end-to-end**: signalGpuEvent sets the event to
     VK_EVENT_RESET (Pending) and queues completion work that flips it to
     VK_EVENT_SET on the watcher thread; DxvkEvent::test reads the status
-    under the spinlock. Occlusion/timestamp queries
-    (beginQuery/endQuery/writeTimestamp) log once + no-op until the
-    Queries stage (visibility buffer); DxvkQuery::getData stays a stub.
+    under the spinlock. Occlusion/timestamp queries + DxvkQuery::getData
+    are real now — see "Stage decisions: queries".
 14. **Latency tracking**: createLatencyTracker returns nullptr on this
     backend, so begin/endLatencyTracking keep upstream bookkeeping but
     are no-ops in practice; debug labels are silent no-ops (no Metal
@@ -464,7 +472,9 @@ tells you exactly what moved).
 16. **Still stubbed in stubs.cpp after this stage**: DxvkContext::draw/
     drawIndexed (Draw stage: PSO build + AB writes + render encoder),
     DxvkQuery::getData (Queries stage), Presenter/SwapchainBlitter/Hud
-    (Present stage), never-constructed Vulkan-only dtors.
+    (Present stage), never-constructed Vulkan-only dtors. (All of these
+    have since been implemented; only the never-constructed Vulkan-only
+    dtor chains remain in stubs.cpp.)
 17. **Runtime status (verified with triangle.exe in the isolated bottle
     dir drive_c/d9mtfe-test)**: device + context + initial CS chunk
     (beginRecording, initial state setters) execute cleanly; the process
@@ -709,9 +719,26 @@ tells you exactly what moved).
 12. **resolveImage**: color resolves via an empty render pass over the MSAA
     source with store_action StoreAndMultisampleResolve + resolve_texture =
     dst (source contents preserved). SAMPLE_ZERO color approximated as
-    AVERAGE (warn-once). Depth-stencil resolves fail loud (winemetal depth
-    attachments expose no resolve target) — ResolveZ/INTZ users will hit
-    this. Partial-region resolves fail loud.
+    AVERAGE (warn-once). **Depth-stencil resolves are real now** (backlog
+    pass; winemetal depth attachments expose no resolve target, so this is
+    DxvkContext::resolveImageFb — the vendored header's framebuffer-resolve
+    slot): fullscreen-triangle pass over the 1x destination's depth+stencil
+    attachments (unified-DS rule: both planes always bound, the
+    not-resolved aspect uses load=Load) whose fragment shader reads sample
+    0 of the MSAA source and exports [[depth(any)]] (+ [[stencil]] shader
+    stencil-export when the stencil aspect resolves: with compare Always +
+    op Replace + write_mask 0xff the exported value replaces the reference
+    and lands in the buffer). Source views: DEPTH-aspect 2D view bound as
+    depth2d_ms, STENCIL-aspect view (X32_Stencil8 alias) as
+    texture2d_ms<uint>. PSOs in d9mt_presenter.cpp (getDepthResolvePso,
+    own MTLLibrary so a stencil-export compile failure cannot kill the
+    color blit library); DSSOs cached in d9mt_context.cpp
+    (getDepthResolveDsso). AVERAGE depth requests (StretchRect depth fast
+    path passes AVERAGE) are performed as SAMPLE_ZERO — info-once, NOT a
+    warn: native d3d9 resolves copy the first sample only (AMD ResolveZ
+    doc), upstream only picks AVERAGE for Vulkan driver-support reasons.
+    Stencil-only resolves fail loud (no d3d9 call site). Partial-region
+    resolves still fail loud.
 13. **Build**: build-dxvkfe.sh adds the 6 SPIRV-Cross TUs (same set as
     scripts/build.sh) and recompiles backend TUs when d9mt_draw.h changes.
 14. **Runtime verified** (CrossOver bottle, drive_c/d9mtfe-test):
@@ -728,6 +755,116 @@ tells you exactly what moved).
     clean against a from-scratch rebuild (build-dxvkfe.sh + build.sh +
     build-host.sh all green) with zero stub hits and zero err/warn lines
     in d3d9fe.log.
+
+## Stage decisions: queries (d9mt_context.cpp; pools in d9mt_device.cpp)
+
+1. **Result side state** (`d9mt::gpuQueryResult`, process-global mutex-guarded
+   map keyed by DxvkGpuQuery pointer): {atomic state Pending/Available/Failed,
+   u64 value}. Watcher thread writes value THEN state (release); getData polls
+   state (acquire) then reads value. Entries persist for pool-token lifetime
+   (bounded by allocator pool sizes) and are reset at re-allocation on the CS
+   thread (safe: pollers only reach a gpu query through DxvkQuery::m_queries,
+   published under the query spinlock AFTER the reset). Results therefore stay
+   Pending until the submission containing end/signal RETIRES (§5.3: the
+   front-end spins GetData+ConsiderFlush; flushCommandList really commits).
+2. **DxvkQuery::getData / accumulate*** mirror upstream v2.7.1 exactly, with
+   accumulateQueryDataForGpuQueryLocked reading the side state instead of
+   vkGetQueryPoolResults (occlusion sums values, timestamp overwrites).
+   begin/end with no draws ⇒ m_queries empty ⇒ Available immediately with 0
+   samples (no hang). Stub removed from stubs.cpp.
+3. **Occlusion = Metal visibility-result buffer.** Per CmdListState: a pooled
+   64 KiB shared-storage MTLBuffer (8192 u64 slots; VirtualAlloc +
+   bytes-no-copy, zeroed at acquire, recycled through a global freelist capped
+   at 8) + bump slot counter + `visSlots` vector of (Rc<DxvkGpuQuery>, slot).
+   The buffer can only be attached at pass creation (WMTRenderPassInfo
+   .visibility_buffer), so startRenderPass attaches it whenever
+   ContextDrawState.activeOcclusionCount != 0 (maintained by DxvkContext::
+   begin/endQuery) and sets CmdListState.visAttached (cleared by endEncoder).
+   On retirement the watcher copies mem[slot] into each gpu query's side state.
+   Slot exhaustion: err once + query marked Failed (loud, no hang).
+4. **DxvkGpuQueryManager is the real upstream design** (active virtual-query
+   set per type, ONE shared gpu query for all simultaneously-active occlusion
+   queries, restart on every boundary): enableQuery/disableQuery/beginQueries/
+   endQueries/restartQueries implemented over visibility slots. A gpu query ==
+   exactly one slot; "ending" it needs NO Metal command (the slot is final once
+   the encoder ends or the mode changes); spanning works by allocating a NEW
+   gpu query per encoder restart and accumulating them on the virtual query
+   (§7 risk 4). restartQueries only encodes setVisibilityResultMode when a
+   render encoder with visAttached is open; otherwise it just drops the
+   current gpu query — encoders that die behind the manager's back (encoder-
+   kind switches in copy paths) are safe because the next startRenderPass
+   calls beginQueries → restart with a fresh slot. When the active set goes
+   empty mid-encoder, counting is explicitly Disabled so later draws cannot
+   corrupt the ended slot. Metal counting is per-sample exact ⇒ PRECISE.
+5. **Lifecycle hooks**: startRenderPass → beginQueries(OCCLUSION) after the
+   encoder opens; spillRenderPass + updateRenderTargets → endQueries before
+   ending the encoder. DxvkContext::beginQuery splits a pass that was started
+   WITHOUT a visibility buffer (spillRenderPass; the next draw restarts it
+   with the buffer bound) — mid-pass Begin on a vis-enabled pass just bumps
+   the slot.
+6. **Timestamps = command buffer GPU end time** (ns, timestampPeriod 1.0):
+   manager writeTimestamp allocs a gpu query (begin+addGpuQuery+end like
+   upstream), forces a real MTLCommandBuffer on the list (ensureCmdBuf) and
+   registers it in CmdListState.tsQueries; the watcher resolves all of them
+   from MTLCommandBuffer_property(GPUEndTime), clamped monotonic via a global
+   last-timestamp (watcher is single-threaded; dxmt's TimestampReadbackCBuf
+   approach). Empty submissions fall back to the last resolved value.
+   TIMESTAMPDISJOINT (2 stamps, disjoint = t0 < t1) is naturally false;
+   TIMESTAMPFREQ is CPU-side in the front-end (1e9). Counter-sample-buffer
+   precision (MTLCounterSampleBuffer exports exist) is a possible later
+   upgrade, not needed for d3d9 semantics.
+7. **Lists reset without submission** (dtor paths) mark their unresolved
+   vis/ts queries Failed in resetCmdListState so pollers never hang; the vis
+   buffer returns to the pool there too.
+8. **ENVIRONMENT FIX (important for any winemetal API newer than CX's
+   bundle)**: the CrossOver bottle loads winemetal from
+   `CrossOver/lib/dxmt/{i386-windows,x86_64-windows,x86_64-unix}` (CX's
+   bundled DXMT), which is OLDER than prebuilt/ and lacked the
+   MTLCommandBuffer_property export — the watcher thread died with wine's
+   "unimplemented function" abort (symptom: occlusion resolved but EVENT
+   flips/timestamps never ran). Replaced all three with the prebuilt
+   binaries (backups: *.d9mt-bak alongside), matching what an earlier agent
+   did for lib/wine/. drive_c/windows/{syswow64,system32}/winemetal.dll also
+   synced (backups *.bak-pre-queries). Ordinal ABI is append-only across
+   DXMT releases, so CX's own dxmt DLLs keep working.
+9. **Runtime verified** (querytest.exe, test/querytest.c, isolated bottle dir
+   drive_c/d9mtfe-test): PRECISE occlusion around two 100x100 quads with a
+   mid-query Clear(ZBUFFER) (forces a render-pass restart) = exactly 20000
+   samples (pass-split spanning proven); empty begin/end scope = 0; reused
+   query on a second frame = exactly 10000 (recycle path); EVENT signals;
+   timestamp > 0 ns; TIMESTAMPDISJOINT false; TIMESTAMPFREQ 1e9. Zero stub
+   hits, zero err/warn in d3d9fe.log. Full 6-test suite (triangle, verifytri,
+   shadertri, texquad, depthtri, extest) re-run green against the same dll;
+   build-dxvkfe.sh + scripts/build.sh + tools/build-host.sh all pass.
+
+## Stage decisions: correctness backlog pass (2026-06-12)
+
+1. **MSAA over-promise fixed** (d9mt_instance.cpp): all sample-count caps
+   (framebuffer*/sampledImage* limits AND getFormatLimits.sampleCounts) now
+   come from d9mt::supportedSampleCounts() — a cached runtime
+   MTLDevice_supportsTextureSampleCount query (mask 0x7 = 1|2|4 on M1; 8x
+   only ever advertised if the device really supports it).
+2. **Sampler LOD bias**: verified unimplementable at the sampler level
+   (WMTSamplerInfo and MTLSamplerDescriptor have no bias field) — stays a
+   documented deviation, see device stage decision 10. NOT faked via
+   lod_min_clamp (would clamp, not bias).
+3. **Depth-stencil resolveImage implemented** — see draw stage decision 12
+   (DxvkContext::resolveImageFb, sample-0 fullscreen pass exporting
+   [[depth(any)]]/[[stencil]]). Covers the d3d9 call sites: StretchRect
+   depth fast path (AVERAGE,SAMPLE_ZERO), MSAA-lock resolve
+   (default,SAMPLE_ZERO), RESZ ResolveZ (SAMPLE_ZERO,SAMPLE_ZERO — note
+   DXVK only triggers RESZ when the adapter vendor id is AMD; ours is
+   0x106b unless d3d9.customVendorId overrides, so GTA IV-class engines
+   reach this via StretchRect/lock paths).
+4. **resolvetest.exe** (test/resolvetest.c, reuses shadertri bytecode;
+   wired into scripts/build.sh): asserts 4x available + "8x advertised ⇒
+   8x RT creatable" (over-promise guard), AVERAGE color resolve via
+   readback (center=FFFF0000/corner=FF101828 exact), and the depth resolve
+   functionally — renders a triangle at z=0.25 into 4x D24S8, StretchRect
+   resolves it to 1x, then draws a fullscreen quad at z=0.5 with LESSEQUAL
+   against the RESOLVED depth without clearing it: center must reject
+   (stays black), corner must accept (green). Verified exact; zero stub
+   hits, zero err/warn in d3d9fe.log; full 8-test suite re-run green.
 
 ## Liveness contracts (deadlock sources — BACKEND-SURFACE §5.1)
 
@@ -759,6 +896,39 @@ waitUntilCompleted; see "Stage decisions: device" item 4).
       scripts/run-fe-suite.sh — launches each exe via DOS path, polls *_out.txt for PASS/FAIL,
       taskkills in-bottle, archives per-test logs as d3d9fe-<exe>.log. Tests render forever
       after PASS by design; the runner kills them.)
-- [ ] Queries (DxvkQuery::getData + occlusion via Metal visibility-result buffer; timestamps),
-      remaining context ops, backlog (DISCARD-rename suballocator, DS resolve, gamma LUT,
-      software cursor, 8x MSAA over-promise, sampler LOD bias)
+- [x] Queries: DxvkQuery::getData + GpuQueryManager + occlusion via Metal
+      visibility-result buffer (pass-split spanning) + EVENT + timestamps via
+      cmdbuf GPU end time (querytest.exe PASS 2026-06-12, exact sample counts;
+      required updating CX lib/dxmt winemetal to prebuilt — see queries stage
+      decision 8)
+- [x] Correctness backlog pass (2026-06-12): runtime-queried MSAA sample-count
+      caps (8x over-promise fixed), depth-stencil resolveImage (sample-0 pass,
+      [[depth]]+[[stencil]] export), sampler LOD bias verified-unimplementable
+      and documented. resolvetest.exe PASS (exact readbacks); full 8-test suite
+      (triangle, verifytri, shadertri, texquad, depthtri, extest, querytest,
+      resolvetest) green; build-dxvkfe.sh + scripts/build.sh + tools/build-host.sh
+      all pass.
+- [x] FINAL VERIFICATION (2026-06-12): all three builds green from clean invocation
+      (scripts/build-dxvkfe.sh, scripts/build.sh, tools/build-host.sh). Fresh
+      build/d3d9fe.dll + all 8 exes redeployed to drive_c/d9mtfe-test; full 8-test
+      FE suite re-run via scripts/run-fe-suite.sh: verifytri, shadertri, texquad,
+      depthtri, extest, querytest, resolvetest all print PASS; triangle.exe (no
+      PASS marker by design — its stdout is fully buffered and taskkill /f drops
+      the "3 frames presented" line) verified via d3d9fe-triangle.exe.log (device
+      init, both shaders compiled, presenter up) + verifytri's pixel readback of
+      the identical scene. Zero d3d9fe-stub.log hits and zero err:/warn: in
+      d3d9fe.log across all 8 (the only err lines are the known fail-loud
+      createBuiltInComputePipeline notices on wine stderr at device init —
+      D3D9FormatHelper conversion shaders, never exercised by the suite; they do
+      not reach d3d9fe.log). Per-test logs archived in-bottle as d3d9fe-<exe>.log;
+      suite transcripts copied to build/fe-suite-final.log. Fallback old-driver
+      suite (build/d3d9.dll from scripts/build.sh, per run-test.sh recipe,
+      isolated drive_c/d9mt-test): shadertri/texquad/depthtri/extest PASS,
+      triangle Init OK + 3 frames presented in d9mt.log (matches 06-11 baseline
+      incl. "(0 passes)" for UP draws); transcript in
+      build/fallback-suite-final.log. Working tree left uncommitted on purpose
+      (queries + resolve work since 0bac5a6).
+- [ ] Remaining context ops, backlog (DISCARD-rename suballocator, gamma LUT,
+      software cursor, per-vis-buffer cap of 8192 occlusion spans per
+      submission, partial-region resolves, packed D24S8/D16 depth buffer
+      copies (Lock of depth surfaces), MSAA/depth/3D blitImageView)

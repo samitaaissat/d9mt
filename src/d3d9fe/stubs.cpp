@@ -79,9 +79,9 @@ namespace dxvk {
     const DxvkDescriptorUpdateInfo* descriptorInfos) D9MT_STUB_BODY
 
   // -------------------------------------------------------- queries/events
-  // (alloc/recycle pools live in d9mt_device.cpp; DxvkEvent::test lives in
-  //  d9mt_context.cpp; query result resolution is the Queries stage)
-  DxvkGpuQueryStatus DxvkQuery::getData(DxvkQueryData& queryData) D9MT_STUB_BODY
+  // (alloc/recycle pools live in d9mt_device.cpp; DxvkEvent::test,
+  //  DxvkQuery::getData and the GpuQueryManager visibility-slot machinery
+  //  live in d9mt_context.cpp)
 
   // ---------------------------------- never-constructed Vulkan-only classes
   // Referenced by member/dtor chains of real objects (command list descriptor

@@ -36,6 +36,7 @@ namespace dxvk::d9mt {
   // -------------------------------------------------------------------------
 
   inline void logf(const char* fmt, ...) {
+#ifndef D9MT_NO_LOG
     static std::mutex s_mutex;
     static FILE*      s_file = nullptr;
 
@@ -53,6 +54,9 @@ namespace dxvk::d9mt {
     va_end(ap);
     std::fputc('\n', s_file);
     std::fflush(s_file);
+#else
+    (void) fmt;
+#endif
   }
 
   // Logs and releases an NSError handle (winemetal convention: out-params

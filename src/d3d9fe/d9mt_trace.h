@@ -107,14 +107,24 @@ namespace dxvk::d9mt {
     ScopedZone& operator=(const ScopedZone&) = delete;
   };
 
+  // Release builds define D9MT_NO_TRACE: the zone scopes and the per-frame
+  // dump compile to nothing — no bool check, no ScopedZone ctor/dtor on the
+  // hot path (it wraps the ~12k draws/binds per frame), zero overhead.
+#ifdef D9MT_NO_TRACE
+  #define D9MT_ZONE(z) ((void) 0)
+#else
   #define D9MT_TRACE_CONCAT_(a, b) a##b
   #define D9MT_TRACE_CONCAT(a, b)  D9MT_TRACE_CONCAT_(a, b)
   #define D9MT_ZONE(z) ::dxvk::d9mt::ScopedZone \
     D9MT_TRACE_CONCAT(d9mtZone_, __LINE__)(z)
+#endif
 
   // Called once per present: stamps frame wall time, dumps a per-zone line,
   // resets the accumulators. One line per frame in d3d9fe-trace.log.
   inline void traceFrameEnd() {
+#ifdef D9MT_NO_TRACE
+    return;
+#else
     if (!traceEnabled())
       return;
 
@@ -153,6 +163,7 @@ namespace dxvk::d9mt {
 
     std::fputc('\n', f);
     std::fflush(f);
+#endif // D9MT_NO_TRACE
   }
 
 }

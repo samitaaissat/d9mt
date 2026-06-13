@@ -11,8 +11,28 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 V="$ROOT/vendor/dxvk"
 BUILD="$ROOT/build"
-OBJ="$BUILD/dxvkfe-obj"
 GEN="$BUILD/dxvkfe-gen"
+
+# RELEASE=1 -> max-speed production build: -O3 + LTO, asserts stripped, and
+# the in-engine trace + file logging COMPILED OUT (not just runtime-disabled),
+# so there is zero instrumentation on the hot path. A separate object cache
+# keeps the dev (-O2, traced) and release object trees from clashing — flags
+# only take effect on a recompile, and mtime caching can't see a flag change.
+RELEASE="${RELEASE:-0}"
+if [[ "$RELEASE" == 1 ]]; then
+  OBJ="$BUILD/dxvkfe-obj-release"
+  # -flto is omitted: mingw's DLL auto-export chokes on LTO'd std::regex
+  # template symbols ("wrong type"). -O3 + NDEBUG + compiled-out trace/log is
+  # the bulk of the win without that fight.
+  OPT_FLAGS=(-O3 -funroll-loops -fno-math-errno
+             -DNDEBUG -DD9MT_NO_TRACE -DD9MT_NO_LOG)
+  LINK_OPT=(-O3)
+  echo "[dxvkfe] RELEASE build — max speed (-O3, no trace, no logging)"
+else
+  OBJ="$BUILD/dxvkfe-obj"
+  OPT_FLAGS=(-O2)
+  LINK_OPT=()
+fi
 mkdir -p "$OBJ" "$GEN"
 
 CXX=i686-w64-mingw32-g++
@@ -20,7 +40,7 @@ CC=i686-w64-mingw32-gcc
 
 # Flags per docs/BACKEND-SURFACE.md §6.4 (mirrors upstream meson.build)
 COMMON_FLAGS=(
-  -O2 -w
+  "${OPT_FLAGS[@]}" -w
   -msse -msse2 -msse3 -mfpmath=sse -mpreferred-stack-boundary=2
   -ffunction-sections -fdata-sections
   -DNOMINMAX -D_WIN32_WINNT=0xa00 -DDXVK_WSI_WIN32
@@ -185,6 +205,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "[dxvkfe] linking d3d9fe.dll"
 "$CXX" -shared -o "$BUILD/d3d9fe.dll" \
+  "${LINK_OPT[@]}" \
   "${OBJS[@]}" \
   -Wl,--gc-sections \
   -static -static-libgcc -static-libstdc++ \

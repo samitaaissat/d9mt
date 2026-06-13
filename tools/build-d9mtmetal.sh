@@ -7,7 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/src/d9mtmetal"
 OUT="$ROOT/build"
-CX="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver"
+CX="${CX:-/Applications/CrossOver.app/Contents/SharedSupport/CrossOver}"
+# CrossOver bottle to install the per-prefix copies + builtin override into.
+# Override for your own game:  BOTTLE="My Game" bash tools/build-d9mtmetal.sh
+BOTTLE="${BOTTLE:-Rockstar Games Launcher}"
 mkdir -p "$OUT/d9mtmetal"
 
 echo "[d9mtmetal] unix .so (x86_64: wine's unix side runs under Rosetta)"
@@ -91,12 +94,12 @@ echo "[d9mtmetal] installing prefix copies (PE search must find the file"
 echo "            to trigger wine's builtin load path; see loader.c"
 echo "            find_builtin_without_file: WINEDLLPATH-only lookup works"
 echo "            solely during prefix bootstrap)"
-BOTTLE_WIN="$HOME/Library/Application Support/CrossOver/Bottles/Rockstar Games Launcher/drive_c/windows"
+BOTTLE_WIN="$HOME/Library/Application Support/CrossOver/Bottles/$BOTTLE/drive_c/windows"
 cp "$OUT/d9mtmetal/d9mtmetal32.dll" "$BOTTLE_WIN/syswow64/d9mtmetal.dll"
 cp "$OUT/d9mtmetal/d9mtmetal64.dll" "$BOTTLE_WIN/system32/d9mtmetal.dll"
 
 echo "[d9mtmetal] registering builtin override in bottle"
-"$CX/bin/wine" --bottle "Rockstar Games Launcher" reg add \
+"$CX/bin/wine" --bottle "$BOTTLE" reg add \
   'HKCU\Software\Wine\DllOverrides' /v d9mtmetal /d builtin /f \
   >/dev/null 2>&1 || true
 

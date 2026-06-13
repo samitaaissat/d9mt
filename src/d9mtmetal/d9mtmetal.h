@@ -19,7 +19,47 @@
 enum d9mt_unix_func {
   D9MT_FUNC_NEW_LIBRARY_FROM_SOURCE = 0,
   D9MT_FUNC_NEW_RENDER_PSO = 1,
+  /* key -> MTLLibrary, with the disk metallib cache + compile backends and
+   * all fallback resolved entirely native-side. The PE passes a content key
+   * and the source bytes; the source is only read on a cache MISS. The
+   * .metallib bytes never cross this ABI — only a handle comes back up. */
+  D9MT_FUNC_LIBRARY_FOR_KEY = 2,
   D9MT_FUNC_COUNT,
+};
+
+/* source_kind values (InputKind). Today every backend is fed MSL_TEXT;
+ * SPIRV/DXBC are reserved for future earlier-input backends (MSC/airconv). */
+enum d9mt_source_kind {
+  D9MT_SOURCE_MSL_TEXT = 0,
+  D9MT_SOURCE_SPIRV = 1,
+  D9MT_SOURCE_DXBC = 2,
+};
+
+/* target_flags bits: codegen/compile options that affect the artifact bytes.
+ * (msl language version is implicit 3.0 today; folded into the key PE-side.) */
+enum d9mt_target_flags {
+  D9MT_TARGET_FAST_MATH = 1u << 0,
+};
+
+/* ret_status values (observable, never branched on for control flow). */
+enum d9mt_library_status {
+  D9MT_LIBRARY_HIT = 0,       /* served from the disk cache               */
+  D9MT_LIBRARY_COMPILED = 1,  /* compiled by a backend, then cached       */
+  D9MT_LIBRARY_FELL_BACK = 2, /* degraded to live newLibraryWithSource    */
+  D9MT_LIBRARY_FAILED = 3,    /* no library produced                      */
+};
+
+struct d9mt_library_params {
+  uint64_t device;       /* in:  obj_handle_t MTLDevice                       */
+  uint64_t key_ptr;      /* in:  const void* ShaderKey digest bytes           */
+  uint64_t key_len;      /* in */
+  uint64_t source_ptr;   /* in:  source blob (only read on a cache MISS)      */
+  uint64_t source_len;   /* in */
+  uint32_t source_kind;  /* in:  enum d9mt_source_kind                        */
+  uint32_t target_flags; /* in:  enum d9mt_target_flags bitmask              */
+  uint64_t ret_library;  /* out: retained MTLLibrary or 0                     */
+  uint64_t ret_status;   /* out: enum d9mt_library_status                     */
+  uint64_t ret_error;    /* out: retained NSError or 0 (caller releases)      */
 };
 
 struct d9mt_newlibrary_params {

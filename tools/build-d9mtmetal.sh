@@ -16,6 +16,7 @@ clang -ObjC -dynamiclib -arch x86_64 -O2 \
   "$SRC/unix.m" \
   -I "$SRC" \
   -install_name @rpath/d9mtmetal.so \
+  -lsqlite3 \
   -framework Metal -framework Foundation
 
 echo "[d9mtmetal] ntdll import libs from CrossOver's ntdll exports"

@@ -31,8 +31,73 @@
 #include "d9mt_trace.h"
 
 #include "../../vendor/spirv-cross/spirv_msl.hpp"
+#include "../../vendor/dxvk/src/util/sha1/sha1_util.h"
 
 namespace dxvk::d9mt {
+
+  // ==========================================================================
+  // metallib disk-cache keying (Layer A). We compute a stable content key over
+  // the FINAL MSL text plus the codegen options; the native side (Layer C)
+  // owns the compile, the disk store, the load, and all fallback. The .metallib
+  // bytes never cross the ABI — only this key goes down, only a handle comes up.
+  //
+  // Keying on the final MSL is the tightest correct key: it transparently
+  // absorbs every upstream DXVK/spirv-cross transform. codegen_epoch is a cheap
+  // belt-and-suspenders global kill switch (bump when our translation pipeline
+  // changes the MSL bytes for the same input). The Metal/OS toolchain
+  // fingerprint is folded in native-side, so it is not part of this key.
+  // ==========================================================================
+
+  namespace {
+    // Bump to invalidate every cached metallib at once (codegen change that
+    // alters MSL bytes for the same input: spirv-cross bump, reflection change).
+    constexpr uint32_t kMetallibCodegenEpoch = 1u;
+
+    // 20-byte SHA-1 content key over (domain ‖ epoch ‖ msl_lang ‖ fast_math ‖
+    // source_kind ‖ MSL bytes). 160-bit, stored as the cache primary key.
+    // The header is serialized into a PACKED, explicit-endian byte buffer —
+    // never a padded struct — so the hashed bytes are deterministic across
+    // builds/compilers (struct padding bytes are unspecified and must not feed
+    // the digest). source_kind domain-separates input kinds so a future
+    // SPIR-V/DXBC backend keyed through the same digest can't collide with MSL.
+    Sha1Hash computeMetallibKey(
+      const std::string& msl,
+            uint16_t     mslLangVersion,
+            uint8_t      fastMath,
+            uint32_t     sourceKind) {
+      uint8_t hdr[13];
+      hdr[0]  = 'L';
+      hdr[1]  = '1';
+      hdr[2]  = uint8_t(kMetallibCodegenEpoch);
+      hdr[3]  = uint8_t(kMetallibCodegenEpoch >> 8);
+      hdr[4]  = uint8_t(kMetallibCodegenEpoch >> 16);
+      hdr[5]  = uint8_t(kMetallibCodegenEpoch >> 24);
+      hdr[6]  = uint8_t(mslLangVersion);
+      hdr[7]  = uint8_t(mslLangVersion >> 8);
+      hdr[8]  = fastMath;
+      hdr[9]  = uint8_t(sourceKind);
+      hdr[10] = uint8_t(sourceKind >> 8);
+      hdr[11] = uint8_t(sourceKind >> 16);
+      hdr[12] = uint8_t(sourceKind >> 24);
+
+      const Sha1Data chunks[] = {
+        { hdr,        sizeof(hdr) },
+        { msl.data(), msl.size()  },
+      };
+      return Sha1Hash::compute(2, chunks);
+    }
+
+    bool metallibCacheEnabled() {
+      // Default on (verified in-game: 149 hits / 0 failures, robust degrade to
+      // live compile on any miss/corruption/toolchain-absence). D9MT_METALLIB_CACHE=0
+      // disables, matching the D9MT_BATCH/SUBALLOC/ASYNC sibling flags.
+      static const bool s_enabled = []() {
+        const char* v = std::getenv("D9MT_METALLIB_CACHE");
+        return !(v && v[0] == '0' && v[1] == '\0');
+      }();
+      return s_enabled;
+    }
+  }
 
   // ==========================================================================
   // sampler heap: shadow array living inside a shared MTLBuffer so the draw
@@ -282,25 +347,70 @@ namespace dxvk::d9mt {
       if (!device)
         return nullptr;
 
-      d9mt_newlibrary_params lp;
-      std::memset(&lp, 0, sizeof(lp));
-      lp.device     = device;
-      lp.source_ptr = uint64_t(uintptr_t(msl.data()));
-      lp.source_len = msl.size();
-      lp.fast_math  = 1;
+      obj_handle_t library = 0;
+      obj_handle_t compileError = 0;
 
-      int status = D9MT_UnixCall(D9MT_FUNC_NEW_LIBRARY_FROM_SOURCE, &lp);
-      if (status != 0 || !lp.ret_library) {
-        Logger::err(str::format("d9mt: MSL compile failed (",
-          shader->debugName(), "), status ", status));
+      if (metallibCacheEnabled()) {
+        // Cache path: compute the content key and let the native side resolve
+        // hit-load / miss-compile-store-load / live-fallback uniformly. The
+        // MSL source is only read native-side on a cache MISS.
+        Sha1Hash key = computeMetallibKey(msl, 0x0300u, /*fastMath*/ 1u,
+                                          uint32_t(D9MT_SOURCE_MSL_TEXT));
+
+        d9mt_library_params lp;
+        std::memset(&lp, 0, sizeof(lp));
+        lp.device       = device;
+        lp.key_ptr      = uint64_t(uintptr_t(&key));
+        lp.key_len      = sizeof(Sha1Digest);
+        lp.source_ptr   = uint64_t(uintptr_t(msl.data()));
+        lp.source_len   = msl.size();
+        lp.source_kind  = D9MT_SOURCE_MSL_TEXT;
+        lp.target_flags = D9MT_TARGET_FAST_MATH;
+
+        int status = D9MT_UnixCall(D9MT_FUNC_LIBRARY_FOR_KEY, &lp);
+        if (status != 0 || !lp.ret_library) {
+          Logger::err(str::format("d9mt: metallib-cache compile failed (",
+            shader->debugName(), "), status ", status));
+          if (lp.ret_error)
+            logNSError("d9mt: metallib cache", lp.ret_error);
+          return nullptr;
+        }
         if (lp.ret_error)
-          logNSError("d9mt: MSL compile", lp.ret_error);
-        return nullptr;
-      }
-      if (lp.ret_error)
-        NSObject_release(lp.ret_error); // warnings only
+          compileError = lp.ret_error; // warnings only
 
-      result->library   = lp.ret_library;
+        library = lp.ret_library;
+        logf("d9mt: metallib %s: %s",
+          lp.ret_status == D9MT_LIBRARY_HIT      ? "HIT" :
+          lp.ret_status == D9MT_LIBRARY_COMPILED ? "COMPILED" :
+          lp.ret_status == D9MT_LIBRARY_FELL_BACK ? "FELL_BACK" : "?",
+          shader->debugName().c_str());
+      } else {
+        // Default path (unchanged): live runtime newLibraryWithSource.
+        d9mt_newlibrary_params lp;
+        std::memset(&lp, 0, sizeof(lp));
+        lp.device     = device;
+        lp.source_ptr = uint64_t(uintptr_t(msl.data()));
+        lp.source_len = msl.size();
+        lp.fast_math  = 1;
+
+        int status = D9MT_UnixCall(D9MT_FUNC_NEW_LIBRARY_FROM_SOURCE, &lp);
+        if (status != 0 || !lp.ret_library) {
+          Logger::err(str::format("d9mt: MSL compile failed (",
+            shader->debugName(), "), status ", status));
+          if (lp.ret_error)
+            logNSError("d9mt: MSL compile", lp.ret_error);
+          return nullptr;
+        }
+        if (lp.ret_error)
+          compileError = lp.ret_error; // warnings only
+
+        library = lp.ret_library;
+      }
+
+      if (compileError)
+        NSObject_release(compileError);
+
+      result->library   = library;
       result->functions = new CompiledShader::FunctionCache();
 
       logf("d9mt: shader compiled: %s (%zu bytes MSL, ab=%u push=%d heap=%d "

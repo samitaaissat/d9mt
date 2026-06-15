@@ -629,6 +629,15 @@ namespace dxvk {
           return nullptr;
         }
 
+        // Pre-fault every page of the freshly Metal-registered block. Under
+        // Rosetta x86_32 + WoW64 the FIRST touch of a newBuffer-no-copy backing
+        // is pathologically slow (~hundreds of ms to >1s for big blocks): the
+        // cliff otherwise lands on the draw hot path (the first frame that
+        // writes a fresh chunk) as a multi-hundred-ms stutter. Faulting the
+        // whole range here moves that cost to chunk creation, and the
+        // suballocator recycles chunks so steady-state writes stay warm.
+        std::memset(mem, 0, ChunkSize);
+
         auto chunk = std::make_unique<Chunk>();
         chunk->buffer  = buffer;
         chunk->base    = reinterpret_cast<uint8_t*>(mem);
@@ -725,6 +734,12 @@ namespace dxvk {
       throw DxvkError(str::format("d9mt: MTLDevice_newBuffer failed (",
         size, " bytes)"));
     }
+
+    // Pre-fault the freshly Metal-registered backing — same Rosetta first-touch
+    // cliff as createChunk(). Dedicated buffers (UP ring orphans, constant ring
+    // wraps, large staging) are the ones the menu hot-path allocates fresh, so
+    // faulting here keeps the per-draw write off the cliff.
+    std::memset(mem, 0, size);
 
     DxvkMemoryType* type = d9mtFindMemoryType(m_memTypes, m_memTypeCount,
       allocationInfo.properties);

@@ -123,6 +123,7 @@ int main(void) {
 
   struct Vertex v[6];
   int frames = 0, verified = 0, ok = 0;
+  DWORD prevRgb = 0xFFFFFFFF; /* impossible XRGB value: no match on frame 1 */
   MSG msg;
   for (;;) {
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -177,7 +178,13 @@ int main(void) {
       IDirect3DSurface9_UnlockRect(sysmem);
 
       const DWORD rgb = px & 0x00FFFFFF;
-      if (rgb != 0x00101010) { /* something drew — classify */
+      /* Latch only after TWO consecutive frames agree: all three quads
+       * share one PSO, and the async compile can flip it hot between two
+       * draws of a single frame — that transition frame can show any
+       * subset of the layers (e.g. red-on-clear = false PASS, or
+       * blue-only = false BROKEN). The frame after the flip has every
+       * draw live, so agreement across two frames screens the race out. */
+      if (rgb != 0x00101010 && rgb == prevRgb) { /* stable — classify */
         verified = 1;
         LOG("center pixel: 0x%08lx (frame %d)", (unsigned long)px, frames);
         if (rgb == 0x00FF0000) {
@@ -192,8 +199,10 @@ int main(void) {
         }
       } else if (frames >= 600) {
         verified = 1;
-        LOG("FAIL: nothing drew in %d frames (pipeline never ready?)",
+        LOG("FAIL: no stable frame in %d frames (pipeline never ready?)",
             frames);
+      } else {
+        prevRgb = rgb;
       }
     }
 

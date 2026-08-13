@@ -799,6 +799,10 @@ namespace dxvk {
     // the front-end takes its stock fallback (same as d9vk on MoltenVK):
     // LEAST_REPRESENTABLE_VALUE representation, bias pre-scaled by
     // GetDepthBufferRValue (2^23 for D32) — which matches Metal's units.
+    // Known residual: D16 surfaces get rValue 2^16 (the format the
+    // front-end believes it uses) while the Metal buffer is Depth32Float
+    // (r ~= 2^-23), leaving the constant bias ~2^7 too small on D16 —
+    // pre-existing, and moot for the D24S8 path WoW uses.
     // Regression test: test/depthbias.c.
     features.extDepthBiasControl.depthBiasControl = VK_FALSE;
     features.extDepthBiasControl.depthBiasExact   = VK_FALSE;

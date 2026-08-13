@@ -788,9 +788,21 @@ namespace dxvk {
 
     features.extDepthClipEnable.depthClipEnable = VK_TRUE;
 
-    features.extDepthBiasControl.depthBiasControl = VK_TRUE;
-    features.extDepthBiasControl.depthBiasExact   = VK_TRUE;
-    features.extDepthBiasControl.floatRepresentation = VK_TRUE;
+    // extDepthBiasControl must NOT be advertised: floatRepresentation
+    // promises the front-end that the depth bias constant is added to z as
+    // a raw float (D3D9 semantics), but the backend hands it verbatim to
+    // MTLRenderCommandEncoder setDepthBias, whose constant is in units of
+    // the least representable depth value (bias * r, r ~= 2^-23 for the
+    // float depth buffers we map D24S8 to). A raw D3D9 bias (order 1e-4)
+    // becomes ~1e-4 * 2^-23 ~= 0 — projected/decal geometry z-fights the
+    // base pass (WoW ground textures clip into terrain). Left unadvertised,
+    // the front-end takes its stock fallback (same as d9vk on MoltenVK):
+    // LEAST_REPRESENTABLE_VALUE representation, bias pre-scaled by
+    // GetDepthBufferRValue (2^23 for D32) — which matches Metal's units.
+    // Regression test: test/depthbias.c.
+    features.extDepthBiasControl.depthBiasControl = VK_FALSE;
+    features.extDepthBiasControl.depthBiasExact   = VK_FALSE;
+    features.extDepthBiasControl.floatRepresentation = VK_FALSE;
 
     features.extRobustness2.robustBufferAccess2 = VK_TRUE;
     features.extRobustness2.nullDescriptor      = VK_TRUE;

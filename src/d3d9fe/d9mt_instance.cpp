@@ -359,6 +359,31 @@ namespace dxvk {
     // matching upstream (Config::merge keeps existing keys)
     m_config = Config::getUserConfig();
     m_config.merge(Config::getAppConfig(env::getExePath()));
+
+    // Adapter identity parity with the retired d9vk renderer. Upstream DXVK
+    // 2.7 hides "nonclassical" vendors behind an AMD RX 6700 XT identity
+    // (d3d9_adapter.cpp fallback), but WoW-era engines key vendor-specific
+    // feature paths off the PCI vendor id — terrain specular among them —
+    // so the renderer swap changed what the GAME chose to render (reported
+    // as "sun reflection on terrain way too glossy"). d9vk exposed the raw
+    // Apple identity (0x106b + Metal device name); default to the same so
+    // a d9vk -> d9mt swap is visually neutral. D9MT_ADAPTER_SPOOF=amd
+    // restores upstream's hiding, and explicit dxvk.conf keys always win
+    // (user config is merged first; merge keeps existing keys).
+    {
+      const char* spoof = std::getenv("D9MT_ADAPTER_SPOOF");
+      if (!(spoof && std::strcmp(spoof, "amd") == 0)) {
+        char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 8] = { };
+        d9mt::mtlDeviceName(name, sizeof(name));
+
+        Config parity;
+        parity.setOption("d3d9.customVendorId",  "106b");
+        parity.setOption("d3d9.customDeviceId",  "00a1");
+        parity.setOption("d3d9.customDeviceDesc", name[0] ? name : "Apple GPU");
+        m_config.merge(parity);
+      }
+    }
+
     m_config.logOptions();
 
     // m_options stays default-constructed: dxvk_options.cpp is not built

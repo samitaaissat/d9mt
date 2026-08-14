@@ -101,6 +101,12 @@ i686-w64-mingw32-gcc -O2 \
   "$ROOT/test/depthbias.c" \
   -ld3d9 -luser32 -lgdi32
 
+echo "[build] compiling bench.exe (i686 PE, no shader blobs)"
+i686-w64-mingw32-gcc -O2 \
+  -o "$BUILD/bench.exe" \
+  "$ROOT/test/bench.c" \
+  -ld3d9 -luser32 -lgdi32
+
 # shader test apps need SM3 bytecode produced by hlsl2dxso.exe under wine
 # (test/<name>_*.hlsl); each is skipped if its blobs are absent
 embed_blob() { # <blob> <header> <symbol>

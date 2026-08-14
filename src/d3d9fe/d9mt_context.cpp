@@ -175,6 +175,10 @@ namespace dxvk::d9mt {
     // render pass starts on this list
     obj_handle_t lastRenderPso  = 0;
     obj_handle_t lastRenderDsso = 0;
+    // set-15 sampler heap binding per stage (0=VS, 1=FS): the heap is one
+    // immutable process-global buffer, so re-emitting it on every resDirty
+    // draw is pure arena traffic — bind once per (encoder, stage, index)
+    int32_t lastSamplerHeap[2] = { -1, -1 };
     // resources already made resident on the current render encoder. Flat
     // open-addressing set (see ResidentSet): markResident is called for every
     // bound resource of every draw, so the per-insert node allocation of a
@@ -301,6 +305,10 @@ namespace dxvk::d9mt {
     VirtualFree(vb.mem, 0, MEM_RELEASE);
   }
 
+  // NOTE(perf, measured): do NOT memo this through `thread_local` — mingw PE
+  // DLLs lower thread_local to emutls (__emutls_get_address call + hash per
+  // access), which benchmarked 3x SLOWER than this uncontended mutex+hash
+  // (micro-probe 'look': 1.55ms -> 4.54ms per 112k calls at 16k draws/frame).
   static CmdListState& cmdListState(const void* list) {
     D9MT_MICRO(0);
     std::lock_guard<std::mutex> lock(s_cmdListMutex);
@@ -1527,14 +1535,19 @@ namespace dxvk::d9mt {
 
     const PsoEntry*     pso = nullptr;
 
-    // Single-entry memo for the render-PSO lookup. Consecutive draws very often
-    // resolve to the same pipeline, so cache the last key + result and skip the
-    // full-state FNV hash + s_psoMutex + unordered_map probe in getRenderPso on
-    // a match. Purely a lookup-cost optimization: the resolved entry is byte-for-
-    // byte what a fresh lookup would return, so this changes timing only, never
-    // observable behavior (downstream dirty/AB logic is unaffected).
-    PsoKey              lastPsoKey = { };
-    const PsoEntry*     lastPsoEntry = nullptr;
+    // Small N-way memo for the render-PSO lookup. Consecutive draws very often
+    // resolve to the same pipeline — but the classic D3D9 frame ALTERNATES a
+    // handful of states (alpha-blend on/off between world and UI batches),
+    // which defeats a single-entry memo every other draw. Four slots cover the
+    // few pipelines a batch ping-pongs between; a scan is 4 early-exit bcmps,
+    // still far cheaper than the full-state FNV hash + s_psoMutex + map probe
+    // in getRenderPso. Purely a lookup-cost optimization: the resolved entry
+    // is byte-for-byte what a fresh lookup would return, so this changes
+    // timing only, never observable behavior.
+    static constexpr uint32_t PsoMemoSize = 4u;
+    PsoKey              lastPsoKey[PsoMemoSize] = { };
+    const PsoEntry*     lastPsoEntry[PsoMemoSize] = { };
+    uint32_t            psoMemoNext = 0u; // round-robin insert cursor
   };
 
   namespace {
@@ -1542,6 +1555,8 @@ namespace dxvk::d9mt {
     std::unordered_map<const void*, std::unique_ptr<ContextDrawState>> s_ctxDrawStates;
   }
 
+  // NOTE(perf, measured): no thread_local memo here either — see the
+  // cmdListState comment (mingw emutls made TLS 3x slower than this lookup).
   static ContextDrawState& ctxDrawStateImpl(const void* ctx) {
     D9MT_MICRO(0);
     std::lock_guard<std::mutex> lock(s_ctxDrawMutex);
@@ -4607,6 +4622,8 @@ namespace dxvk {
     auto& cstate = d9mt::cmdListState(m_cmd.ptr());
     cstate.lastRenderPso  = 0;
     cstate.lastRenderDsso = 0;
+    cstate.lastSamplerHeap[0] = -1;
+    cstate.lastSamplerHeap[1] = -1;
     cstate.renderResident.reset();
 
     // restart active occlusion queries into a fresh visibility slot of the
@@ -4687,17 +4704,24 @@ namespace dxvk {
       key.state.ilBindings[i].setStride(m_state.vi.vertexStrides[binding]);
     }
 
-    // Memo hit: same key as the previous draw → reuse the resolved entry and
-    // skip the hash + mutex + map probe. entry->pso is atomic, so a still-
-    // compiling entry memoed here is re-checked below and picked up once ready.
-    const d9mt::PsoEntry* entry;
-    if (dstate.lastPsoEntry && key == dstate.lastPsoKey) {
-      entry = dstate.lastPsoEntry;
-    } else {
+    // Memo hit: same key as one of the last few distinct draws → reuse the
+    // resolved entry and skip the hash + mutex + map probe. entry->pso is
+    // atomic, so a still-compiling entry memoed here is re-checked below and
+    // picked up once ready.
+    const d9mt::PsoEntry* entry = nullptr;
+    for (uint32_t i = 0; i < d9mt::ContextDrawState::PsoMemoSize; i++) {
+      if (dstate.lastPsoEntry[i] && key == dstate.lastPsoKey[i]) {
+        entry = dstate.lastPsoEntry[i];
+        break;
+      }
+    }
+    if (!entry) {
       entry = d9mt::getRenderPso(key, vs, fs);
       if (entry) {
-        dstate.lastPsoKey   = key;
-        dstate.lastPsoEntry = entry;
+        const uint32_t slot = dstate.psoMemoNext;
+        dstate.psoMemoNext = (slot + 1u) % d9mt::ContextDrawState::PsoMemoSize;
+        dstate.lastPsoKey[slot]   = key;
+        dstate.lastPsoEntry[slot] = entry;
       }
     }
 
@@ -4717,8 +4741,13 @@ namespace dxvk {
       // (constants + sampler-heap indices) still refreshes on every PSO swap.
       const d9mt::PsoEntry* prev = dstate.pso;
       dstate.pso = entry;
-      if (!prev || prev->vs != entry->vs || prev->fs != entry->fs)
-        m_descriptorState.dirtyStages(VK_SHADER_STAGE_ALL_GRAPHICS);
+      // AB layout is per-stage shader reflection: only re-dirty the stage
+      // whose shader actually changed (pairs with the per-stage rebuild in
+      // updateGraphicsShaderResources).
+      if (!prev || prev->vs != entry->vs)
+        m_descriptorState.dirtyStages(VK_SHADER_STAGE_VERTEX_BIT);
+      if (!prev || prev->fs != entry->fs)
+        m_descriptorState.dirtyStages(VK_SHADER_STAGE_FRAGMENT_BIT);
       m_flags.set(DxvkContextFlag::DirtyPushData);
     }
 
@@ -4937,19 +4966,65 @@ namespace dxvk {
         m_device, VkDeviceSize(4u) << 20u);
     }
 
-    // Split the rebuild by what actually changed. The argument buffer (textures
-    // + uniform-buffer addresses) and the static sampler-heap binding only need
-    // rebuilding when descriptors are dirty; the push block (shader constants)
-    // when push data is dirty. The common per-object draw only changes constants
-    // (new transform), so this skips the expensive AB assembly + residency +
-    // resource-tracking loop on those draws. Encoder bindings persist within a
-    // pass, and every pass restart re-dirties all of this (startRenderPass), so
-    // skipping an unchanged rebind is safe. The push block embeds sampler-heap
-    // indices, so it also rebuilds when descriptors change.
-    const bool resDirty  = m_descriptorState.hasDirtyResources(VK_SHADER_STAGE_ALL_GRAPHICS);
+    // Split the rebuild by what actually changed — PER STAGE. Every bind path
+    // marks dirty with real stage bits (bindResourceImageView/-Sampler take
+    // stages; invalidateBuffer uses buffer->getShaderStages()), and the
+    // conservative sites (startRenderPass, PSO shader swap, full reset) mark
+    // ALL_GRAPHICS, so a stage whose bit is clear is exactly a stage whose
+    // encoder bindings are still current. The two dominant D3D9 patterns each
+    // used to rebuild both stages: a VS-constants rename (SetTransform) forced
+    // the FS AB + residency loop, and a PS SetTexture forced the VS AB. The
+    // argument buffer (textures + uniform-buffer addresses) and the static
+    // sampler-heap binding rebuild when that stage's descriptors are dirty;
+    // the push block (shader constants) when push data is dirty. Encoder
+    // bindings persist within a pass, and every pass restart re-dirties all of
+    // this (startRenderPass), so skipping an unchanged rebind is safe. The
+    // push block embeds sampler-heap indices, so it also rebuilds when the
+    // stage's descriptors change.
     const bool pushDirty = m_flags.test(DxvkContextFlag::DirtyPushData);
+    const bool stageResDirty[2] = {
+      m_descriptorState.hasDirtyResources(VK_SHADER_STAGE_VERTEX_BIT),
+      m_descriptorState.hasDirtyResources(VK_SHADER_STAGE_FRAGMENT_BIT),
+    };
+
+    // ---- ONE ring allocation + ONE track() per invocation. The AB and push
+    // sections of every dirty stage are carved (256-aligned, matching the
+    // ring's own alignment) out of a single slice: 3-4 alloc/slice/track
+    // round-trips per draw collapse into one — Rc refcount traffic and
+    // tracker appends are a measured chunk of per-draw CPU under Rosetta.
+    VkDeviceSize secOff[4] = { };
+    VkDeviceSize packedSize = 0u;
+    for (uint32_t stage = 0; stage < 2u; stage++) {
+      const d9mt::CompiledShader* shader = stage ? pso->fs : pso->vs;
+      const VkDeviceSize abBytes = (stageResDirty[stage] && shader->abEntryCount)
+        ? VkDeviceSize(shader->abEntryCount) * 8u : 0u;
+      const VkDeviceSize pushBytes = ((pushDirty || stageResDirty[stage])
+          && shader->pushBufferIndex >= 0 && shader->pushDataSize)
+        ? VkDeviceSize(shader->pushDataSize) : 0u;
+      secOff[2u * stage + 0u] = packedSize;
+      packedSize += dxvk::align(abBytes, 256u);
+      secOff[2u * stage + 1u] = packedSize;
+      packedSize += dxvk::align(pushBytes, 256u);
+    }
+
+    DxvkBufferSlice packedSlice;
+    DxvkResourceBufferInfo packedInfo = { };
+    uint8_t* packedPtr = nullptr;
+    if (packedSize) {
+      D9MT_MICRO_BEG(tPackAlloc);
+      packedSlice = dstate.ring->alloc(packedSize);
+      packedPtr = reinterpret_cast<uint8_t*>(packedSlice.mapPtr(0));
+      if (!packedPtr) {
+        Logger::err("d9mt: shader-resource staging allocation failed");
+        return false;
+      }
+      packedInfo = packedSlice.getSliceInfo();
+      m_cmd->track(packedSlice.buffer(), DxvkAccess::Read);
+      D9MT_MICRO_END(12, tPackAlloc);
+    }
 
     for (uint32_t stage = 0; stage < 2u; stage++) {
+      const bool resDirty = stageResDirty[stage];
       const d9mt::CompiledShader* shader = stage ? pso->fs : pso->vs;
       WMTRenderCommandType setBufferType = stage
         ? WMTRenderCommandSetFragmentBuffer
@@ -4957,17 +5032,9 @@ namespace dxvk {
 
       // ---- set-0 argument buffer
       if (resDirty && shader->abEntryCount) {
-        D9MT_MICRO_BEG(tAbAlloc);
-        DxvkBufferSlice slice = dstate.ring->alloc(
-          VkDeviceSize(shader->abEntryCount) * 8u);
-
-        uint64_t* ab = reinterpret_cast<uint64_t*>(slice.mapPtr(0));
-        if (!ab) {
-          Logger::err("d9mt: argument buffer allocation failed");
-          return false;
-        }
+        uint64_t* ab = reinterpret_cast<uint64_t*>(
+          packedPtr + secOff[2u * stage + 0u]);
         std::memset(ab, 0, size_t(shader->abEntryCount) * 8u);
-        D9MT_MICRO_END(12, tAbAlloc);
 
         D9MT_MICRO_BEG(tAbLoop);
         for (const auto& ref : shader->resources) {
@@ -5028,29 +5095,19 @@ namespace dxvk {
         D9MT_MICRO_END(13, tAbLoop);
 
         D9MT_MICRO_BEG(tAbEnc);
-        auto sliceInfo = slice.getSliceInfo();
-
         wmtcmd_render_setbuffer cmd = { };
         cmd.type = setBufferType;
-        cmd.buffer = obj_handle_t(sliceInfo.buffer);
-        cmd.offset = sliceInfo.offset;
+        cmd.buffer = obj_handle_t(packedInfo.buffer);
+        cmd.offset = packedInfo.offset + secOff[2u * stage + 0u];
         cmd.index = uint8_t(shader->abBufferIndex);
         d9mt::encodeRenderCmd(cstate, &cmd);
-
-        m_cmd->track(slice.buffer(), DxvkAccess::Read);
         D9MT_MICRO_END(14, tAbEnc);
       }
 
       // ---- push data block (+ sampler heap indices at their blockOffsets)
       if ((pushDirty || resDirty) && shader->pushBufferIndex >= 0 && shader->pushDataSize) {
         D9MT_MICRO_BEG(tPush);
-        DxvkBufferSlice slice = dstate.ring->alloc(shader->pushDataSize);
-
-        uint8_t* data = reinterpret_cast<uint8_t*>(slice.mapPtr(0));
-        if (!data) {
-          Logger::err("d9mt: push data allocation failed");
-          return false;
-        }
+        uint8_t* data = packedPtr + secOff[2u * stage + 1u];
         std::memset(data, 0, shader->pushDataSize);
 
         for (const auto& block : shader->pushBlocks) {
@@ -5088,21 +5145,19 @@ namespace dxvk {
         D9MT_MICRO_END(16, tSmpLoop);
 
         D9MT_MICRO_BEG(tPushEnc);
-        auto sliceInfo = slice.getSliceInfo();
-
         wmtcmd_render_setbuffer cmd = { };
         cmd.type = setBufferType;
-        cmd.buffer = obj_handle_t(sliceInfo.buffer);
-        cmd.offset = sliceInfo.offset;
+        cmd.buffer = obj_handle_t(packedInfo.buffer);
+        cmd.offset = packedInfo.offset + secOff[2u * stage + 1u];
         cmd.index = uint8_t(shader->pushBufferIndex);
         d9mt::encodeRenderCmd(cstate, &cmd);
-
-        m_cmd->track(slice.buffer(), DxvkAccess::Read);
         D9MT_MICRO_END(17, tPushEnc);
       }
 
-      // ---- set-15 sampler heap
-      if (resDirty && shader->samplerHeapIndex >= 0) {
+      // ---- set-15 sampler heap (immutable global buffer: bind once per
+      // encoder per stage; only a changed reflected index re-emits)
+      if (resDirty && shader->samplerHeapIndex >= 0
+       && cstate.lastSamplerHeap[stage] != shader->samplerHeapIndex) {
         obj_handle_t heap = d9mt::samplerHeapBuffer();
 
         if (heap) {
@@ -5112,6 +5167,7 @@ namespace dxvk {
           cmd.offset = 0u;
           cmd.index = uint8_t(shader->samplerHeapIndex);
           d9mt::encodeRenderCmd(cstate, &cmd);
+          cstate.lastSamplerHeap[stage] = shader->samplerHeapIndex;
         } else {
           static bool s_warned = false;
           if (!std::exchange(s_warned, true))

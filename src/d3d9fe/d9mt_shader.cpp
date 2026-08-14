@@ -342,6 +342,58 @@ namespace dxvk::d9mt {
         return nullptr;
       }
 
+      // Precompute push coverage: bytes written per draw by the block copies
+      // (non-masked dwords) and the 2-byte sampler-index writes. Whatever is
+      // left must be zeroed at upload; collecting it here replaces the
+      // per-draw memset of the whole block with a few tiny range stores.
+      {
+        std::array<bool, MaxTotalPushDataSize> covered = { };
+
+        for (const auto& block : result->pushBlocks) {
+          for (uint32_t dw = 0; dw < block.size / 4u; dw++) {
+            if (!(block.resourceMask & (uint64_t(1u) << dw))) {
+              for (uint32_t b = 0; b < 4u; b++) {
+                uint32_t off = block.dstOffset + 4u * dw + b;
+                if (off < result->pushDataSize)
+                  covered[off] = true;
+              }
+            }
+          }
+        }
+
+        for (const auto& s : result->samplers) {
+          if (uint32_t(s.blockOffset) + 2u <= result->pushDataSize) {
+            covered[s.blockOffset]      = true;
+            covered[s.blockOffset + 1u] = true;
+          }
+        }
+
+        for (uint32_t off = 0; off < result->pushDataSize; ) {
+          if (covered[off]) { off++; continue; }
+          uint32_t end = off;
+          while (end < result->pushDataSize && !covered[end])
+            end++;
+          result->pushZeroRanges.push_back(
+            { uint16_t(off), uint16_t(end - off) });
+          off = end;
+        }
+      }
+
+      // AB coverage: every slot written by the resources loop (null bindings
+      // write an explicit 0 in the draw path) -> per-draw memset skippable.
+      {
+        std::array<bool, 64> abCovered = { };
+        bool inRange = result->abEntryCount <= abCovered.size();
+        if (inRange) {
+          for (const auto& ref : result->resources)
+            if (ref.abId < result->abEntryCount)
+              abCovered[ref.abId] = true;
+          result->abFullyCovered = true;
+          for (uint32_t i = 0; i < result->abEntryCount; i++)
+            result->abFullyCovered &= abCovered[i];
+        }
+      }
+
       if (const char* dump = std::getenv("D9MT_DUMP_MSL")) {
         std::string path = std::string(dump) + "\\" + shader->debugName() + ".metal";
         if (FILE* f = std::fopen(path.c_str(), "w")) {

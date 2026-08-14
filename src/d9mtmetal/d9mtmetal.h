@@ -35,7 +35,28 @@ enum d9mt_unix_func {
    * ourselves. Requires MTL_CAPTURE_ENABLED=1 at launch. action: 1=begin, 0=end.
    * begin captures all command buffers on `queue` until end is called. */
   D9MT_FUNC_CAPTURE = 4,
+  /* Fused render-encoder transition: end the old encoder (if any) and begin
+   * a render pass on the command buffer in ONE PE->unix crossing, instead of
+   * the 6-7 winemetal crossings (endEncoding, release, pool alloc, encoder
+   * create, retain, pool release) a pass restart costs today. Pass restarts
+   * are the dominant CPU cost of render-target round-trips (WoW shadow
+   * blobs / shadow maps: measured 32us avg per startRenderPass, 75% of the
+   * frame in the rt benchmark). Handles interoperate with winemetal's (raw
+   * ObjC pointers, same process). pass_ptr uses winemetal's WMTRenderPassInfo
+   * layout (pinned DXMT v0.80); the descriptor translation is mirrored
+   * native-side. end_immediately=1 encodes a load/store-action-only pass
+   * (deferred clears) and returns no encoder. pass_ptr=0 = end-only. */
+  D9MT_FUNC_PASS_TRANSITION = 5,
   D9MT_FUNC_COUNT,
+};
+
+struct d9mt_pass_transition_params {
+  uint64_t cmdbuf;          /* in: MTLCommandBuffer handle (needed unless end-only) */
+  uint64_t old_encoder;     /* in: encoder to endEncoding+release, or 0            */
+  uint64_t pass_ptr;        /* in: const struct WMTRenderPassInfo*, or 0=end-only  */
+  uint32_t end_immediately; /* in: 1 = end the new pass right away (clear pass)    */
+  uint32_t padding;
+  uint64_t ret_encoder;     /* out: retained MTLRenderCommandEncoder or 0          */
 };
 
 struct d9mt_capture_params {

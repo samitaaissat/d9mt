@@ -166,6 +166,9 @@ namespace dxvk::d9mt {
     obj_handle_t cmdbuf  = 0;                 // retained
     obj_handle_t encoder = 0;                 // retained while open
     EncoderKind  kind    = EncoderKind::None;
+    uint32_t     gen     = 0;                 // unique per incarnation
+    uint32_t     encoderEpoch = 0;            // bumped per render encoder
+                                              // (raw handles can be reused)
 
     // per-submission completion work (EVENT query flips etc.), run on the
     // watcher thread when the command buffer retires
@@ -309,12 +312,19 @@ namespace dxvk::d9mt {
   // DLLs lower thread_local to emutls (__emutls_get_address call + hash per
   // access), which benchmarked 3x SLOWER than this uncontended mutex+hash
   // (micro-probe 'look': 1.55ms -> 4.54ms per 112k calls at 16k draws/frame).
+  // Monotonic id per CmdListState incarnation. Ring-slice/binding caches in
+  // ContextDrawState key on it so a recycled command-list pointer (same map
+  // key, fresh state) can never validate a stale cached slice.
+  static std::atomic<uint32_t> s_cmdListGen{ 1u };
+
   static CmdListState& cmdListState(const void* list) {
     D9MT_MICRO(0);
     std::lock_guard<std::mutex> lock(s_cmdListMutex);
     auto& slot = s_cmdListStates[list];
-    if (!slot)
+    if (!slot) {
       slot = std::make_unique<CmdListState>();
+      slot->gen = s_cmdListGen.fetch_add(1u, std::memory_order_relaxed);
+    }
     return *slot;
   }
 
@@ -344,8 +354,10 @@ namespace dxvk::d9mt {
   static void endEncoder(CmdListState& state) {
     if (state.encoder) {
       flushRenderCmds(state); // drain pending render commands first
-      MTLCommandEncoder_endEncoding(state.encoder);
-      NSObject_release(state.encoder);
+      // fused end (endEncoding + release in one PE->unix crossing)
+      d9mt_pass_transition_params p = { };
+      p.old_encoder = state.encoder;
+      D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
       state.encoder = 0;
       state.kind = EncoderKind::None;
     }
@@ -465,21 +477,32 @@ namespace dxvk::d9mt {
   }
 
   // Standalone render pass with no draws: the load/store actions do all the
-  // work (clears / discards). Ends any open encoder first.
+  // work (clears / discards). Ends any open encoder first. The whole
+  // end-old + begin + end-new sequence is ONE fused d9mtmetal crossing.
   static void encodeEmptyRenderPass(CmdListState& state, WMTRenderPassInfo& pass) {
-    endEncoder(state);
+    if (state.encoder)
+      flushRenderCmds(state);
 
-    if (!ensureCmdBuf(state))
+    if (!ensureCmdBuf(state)) {
+      // still must end the open encoder for state consistency
+      endEncoder(state);
       return;
+    }
 
-    obj_handle_t pool = NSAutoreleasePool_alloc_init();
-    obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(state.cmdbuf, &pass);
-    if (enc)
-      MTLCommandEncoder_endEncoding(enc);
-    else
+    d9mt_pass_transition_params p = { };
+    p.cmdbuf          = state.cmdbuf;
+    p.old_encoder     = state.encoder;
+    p.pass_ptr        = uint64_t(reinterpret_cast<uintptr_t>(&pass));
+    p.end_immediately = 1;
+    D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
+
+    state.encoder = 0;
+    state.kind = EncoderKind::None;
+    state.visAttached = false;
+
+    if (!p.padding)
       logf("d9mt: renderCommandEncoder failed (clear pass %ux%u)",
         pass.render_target_width, pass.render_target_height);
-    NSObject_release(pool);
   }
 
   // Ends recording on a command list and commits its MTLCommandBuffer.
@@ -553,22 +576,34 @@ namespace dxvk::d9mt {
 
   obj_handle_t cmdListBeginRenderPass(const void* list, WMTRenderPassInfo& pass) {
     auto& state = cmdListState(list);
-    endEncoder(state);
 
-    if (!ensureCmdBuf(state))
+    // Fused transition: flush pending commands (one winemetal crossing when
+    // non-empty), then end-old + begin-new in ONE d9mtmetal crossing —
+    // instead of the 6-7 crossings the split path costs. Pass restarts are
+    // the dominant CPU cost of WoW's shadow render-target round-trips.
+    if (state.encoder)
+      flushRenderCmds(state);
+
+    if (!ensureCmdBuf(state)) {
+      endEncoder(state);
       return 0;
+    }
 
-    obj_handle_t pool = NSAutoreleasePool_alloc_init();
-    obj_handle_t enc = MTLCommandBuffer_renderCommandEncoder(state.cmdbuf, &pass);
-    if (enc)
-      NSObject_retain(enc);
-    else
+    d9mt_pass_transition_params p = { };
+    p.cmdbuf      = state.cmdbuf;
+    p.old_encoder = state.encoder;
+    p.pass_ptr    = uint64_t(reinterpret_cast<uintptr_t>(&pass));
+    D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
+
+    obj_handle_t enc = obj_handle_t(p.ret_encoder);
+    if (!enc)
       logf("d9mt: renderCommandEncoder failed (external pass %ux%u)",
         pass.render_target_width, pass.render_target_height);
-    NSObject_release(pool);
 
     state.encoder = enc;
     state.kind = enc ? EncoderKind::Render : EncoderKind::None;
+    state.visAttached = false;
+    state.encoderEpoch++;
     return enc;
   }
 
@@ -1548,6 +1583,26 @@ namespace dxvk::d9mt {
     PsoKey              lastPsoKey[PsoMemoSize] = { };
     const PsoEntry*     lastPsoEntry[PsoMemoSize] = { };
     uint32_t            psoMemoNext = 0u; // round-robin insert cursor
+
+    // Per-stage push-block upload cache. The push block (render-state
+    // constants + sampler-heap indices) is re-uploaded whenever its dirty
+    // flags fire, but its CONTENT is stable across long draw runs (sampler
+    // indices only change when sampler OBJECTS change; the shared block when
+    // render state does). Assemble into the persistent shadow, memcmp, and
+    // skip the ring section + rebind when the bytes match and the previous
+    // slice is still valid (same command-list incarnation). The slice was
+    // tracked when uploaded; a Metal buffer BINDING carries residency, so a
+    // rebind of the old slice on a new encoder is all a pass restart needs.
+    struct PushBindCache {
+      const d9mt::CompiledShader* shader = nullptr; // layout identity
+      uint64_t     sliceBuffer  = 0;   // wmt buffer handle of the last upload
+      uint64_t     sliceOffset  = 0;   // absolute offset of the push section
+      uint32_t     boundEpoch   = 0;   // encoderEpoch the binding was emitted on
+      uint32_t     cmdGen       = 0;   // CmdListState::gen of the last upload
+      bool         valid        = false;
+      alignas(8) uint8_t shadow[256];  // MaxTotalPushDataSize
+    };
+    PushBindCache pushCache[2];
   };
 
   namespace {
@@ -4987,6 +5042,80 @@ namespace dxvk {
       m_descriptorState.hasDirtyResources(VK_SHADER_STAGE_FRAGMENT_BIT),
     };
 
+    // ---- Phase 1: assemble each dirty stage's push block into a stack
+    // scratch and compare against the last uploaded content (persistent
+    // per-stage shadow). Push content is stable across long draw runs —
+    // sampler-heap indices only change when sampler OBJECTS change and the
+    // shared block only when render state does — so most "dirty" pushes are
+    // byte-identical re-uploads. A match skips the ring section + encode
+    // entirely (binding persists on the encoder); across a pass restart it
+    // degrades to a single re-bind of the previous slice (still alive: same
+    // command-list incarnation, tracked at upload; a Metal buffer BINDING
+    // carries residency on the new encoder).
+    bool pushUpload[2] = { false, false }; // fresh section + upload + bind
+    bool pushRebind[2] = { false, false }; // re-bind cached slice only
+    alignas(8) uint8_t pushScratch[2][MaxTotalPushDataSize];
+
+    for (uint32_t stage = 0; stage < 2u; stage++) {
+      const d9mt::CompiledShader* shader = stage ? pso->fs : pso->vs;
+      if (!((pushDirty || stageResDirty[stage])
+          && shader->pushBufferIndex >= 0 && shader->pushDataSize))
+        continue;
+
+      D9MT_MICRO_BEG(tPush);
+      uint8_t* data = pushScratch[stage];
+
+      // zero only the bytes the copies below do not cover (precomputed)
+      for (const auto& range : shader->pushZeroRanges)
+        std::memset(data + range.first, 0, range.second);
+
+      for (const auto& block : shader->pushBlocks) {
+        if (block.resourceMask == 0u) {
+          // No interleaved sampler-index dwords: the per-dword loop would copy
+          // every dword, so blast the whole block in one memcpy. (Blocks are
+          // dword-aligned, so block.size bytes is exact.)
+          std::memcpy(data + block.dstOffset,
+            &m_state.pc.constantData[block.srcOffset], block.size);
+        } else {
+          for (uint32_t dw = 0; dw < block.size / 4u; dw++) {
+            if (!(block.resourceMask & (uint64_t(1u) << dw))) {
+              std::memcpy(data + block.dstOffset + 4u * dw,
+                &m_state.pc.constantData[block.srcOffset + 4u * dw], 4u);
+            }
+          }
+        }
+      }
+      D9MT_MICRO_END(15, tPush);
+
+      D9MT_MICRO_BEG(tSmpLoop);
+      for (const auto& ref : shader->samplers) {
+        uint16_t index = 0u;
+
+        const auto& sampler = m_samplers[ref.slot];
+        if (sampler != nullptr) {
+          index = sampler->getDescriptor().samplerIndex;
+          // track here (not in the upload phase): the sampler stays
+          // GPU-referenced through the heap index even on the skip path
+          m_cmd->track(sampler);
+        }
+
+        if (uint32_t(ref.blockOffset) + 2u <= shader->pushDataSize)
+          std::memcpy(data + ref.blockOffset, &index, sizeof(index));
+      }
+      D9MT_MICRO_END(16, tSmpLoop);
+
+      auto& cache = dstate.pushCache[stage];
+      if (cache.valid && cache.shader == shader
+       && cache.cmdGen == cstate.gen
+       && !std::memcmp(data, cache.shadow, shader->pushDataSize)) {
+        // content unchanged and the old slice is still valid
+        if (cache.boundEpoch != cstate.encoderEpoch)
+          pushRebind[stage] = true;   // fresh encoder: re-bind old slice
+      } else {
+        pushUpload[stage] = true;
+      }
+    }
+
     // ---- ONE ring allocation + ONE track() per invocation. The AB and push
     // sections of every dirty stage are carved (256-aligned, matching the
     // ring's own alignment) out of a single slice: 3-4 alloc/slice/track
@@ -4998,8 +5127,7 @@ namespace dxvk {
       const d9mt::CompiledShader* shader = stage ? pso->fs : pso->vs;
       const VkDeviceSize abBytes = (stageResDirty[stage] && shader->abEntryCount)
         ? VkDeviceSize(shader->abEntryCount) * 8u : 0u;
-      const VkDeviceSize pushBytes = ((pushDirty || stageResDirty[stage])
-          && shader->pushBufferIndex >= 0 && shader->pushDataSize)
+      const VkDeviceSize pushBytes = pushUpload[stage]
         ? VkDeviceSize(shader->pushDataSize) : 0u;
       secOff[2u * stage + 0u] = packedSize;
       packedSize += dxvk::align(abBytes, 256u);
@@ -5034,12 +5162,17 @@ namespace dxvk {
       if (resDirty && shader->abEntryCount) {
         uint64_t* ab = reinterpret_cast<uint64_t*>(
           packedPtr + secOff[2u * stage + 0u]);
-        std::memset(ab, 0, size_t(shader->abEntryCount) * 8u);
+        // every covered slot writes its word below (null bindings write 0),
+        // so the memset only pays for shaders with uncovered slots
+        if (!shader->abFullyCovered)
+          std::memset(ab, 0, size_t(shader->abEntryCount) * 8u);
 
         D9MT_MICRO_BEG(tAbLoop);
         for (const auto& ref : shader->resources) {
           if (ref.abId >= shader->abEntryCount)
             continue; // defensive: never write outside the allocation
+
+          uint64_t word = 0u;
 
           switch (ref.type) {
             case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
@@ -5056,7 +5189,7 @@ namespace dxvk {
                 break; // nullDescriptor: word stays 0
 
               auto info = buffer.getSliceInfo();
-              ab[ref.abId] = info.gpuAddress;
+              word = info.gpuAddress;
 
               d9mt::markResident(cstate, obj_handle_t(info.buffer));
               m_cmd->track(buffer.buffer(), DxvkAccess::Read);
@@ -5072,9 +5205,7 @@ namespace dxvk {
               if (!descriptor || !descriptor->legacy.image.imageView)
                 break;
 
-              uint64_t word;
               std::memcpy(&word, descriptor->descriptor.data(), sizeof(word));
-              ab[ref.abId] = word;
 
               d9mt::markResident(cstate,
                 obj_handle_t(descriptor->legacy.image.imageView));
@@ -5090,6 +5221,8 @@ namespace dxvk {
                   uint32_t(ref.type)));
             } break;
           }
+
+          ab[ref.abId] = word;
         }
 
         D9MT_MICRO_END(13, tAbLoop);
@@ -5104,53 +5237,42 @@ namespace dxvk {
         D9MT_MICRO_END(14, tAbEnc);
       }
 
-      // ---- push data block (+ sampler heap indices at their blockOffsets)
-      if ((pushDirty || resDirty) && shader->pushBufferIndex >= 0 && shader->pushDataSize) {
-        D9MT_MICRO_BEG(tPush);
-        uint8_t* data = packedPtr + secOff[2u * stage + 1u];
-        std::memset(data, 0, shader->pushDataSize);
-
-        for (const auto& block : shader->pushBlocks) {
-          if (block.resourceMask == 0u) {
-            // No interleaved sampler-index dwords: the per-dword loop would copy
-            // every dword, so blast the whole block in one memcpy. (Blocks are
-            // dword-aligned, so block.size bytes is exact.)
-            std::memcpy(data + block.dstOffset,
-              &m_state.pc.constantData[block.srcOffset], block.size);
-          } else {
-            for (uint32_t dw = 0; dw < block.size / 4u; dw++) {
-              if (!(block.resourceMask & (uint64_t(1u) << dw))) {
-                std::memcpy(data + block.dstOffset + 4u * dw,
-                  &m_state.pc.constantData[block.srcOffset + 4u * dw], 4u);
-              }
-            }
-          }
-        }
-
-        D9MT_MICRO_END(15, tPush);
-
-        D9MT_MICRO_BEG(tSmpLoop);
-        for (const auto& ref : shader->samplers) {
-          uint16_t index = 0u;
-
-          const auto& sampler = m_samplers[ref.slot];
-          if (sampler != nullptr) {
-            index = sampler->getDescriptor().samplerIndex;
-            m_cmd->track(sampler);
-          }
-
-          if (uint32_t(ref.blockOffset) + 2u <= shader->pushDataSize)
-            std::memcpy(data + ref.blockOffset, &index, sizeof(index));
-        }
-        D9MT_MICRO_END(16, tSmpLoop);
-
+      // ---- push data block (assembled + compared in phase 1; here we only
+      // upload changed bytes or re-bind the cached slice on a new encoder)
+      if (pushUpload[stage]) {
         D9MT_MICRO_BEG(tPushEnc);
+        auto& cache = dstate.pushCache[stage];
+
+        uint8_t* data = packedPtr + secOff[2u * stage + 1u];
+        std::memcpy(data, pushScratch[stage], shader->pushDataSize);
+        std::memcpy(cache.shadow, pushScratch[stage], shader->pushDataSize);
+
         wmtcmd_render_setbuffer cmd = { };
         cmd.type = setBufferType;
         cmd.buffer = obj_handle_t(packedInfo.buffer);
         cmd.offset = packedInfo.offset + secOff[2u * stage + 1u];
         cmd.index = uint8_t(shader->pushBufferIndex);
         d9mt::encodeRenderCmd(cstate, &cmd);
+
+        cache.shader      = shader;
+        cache.sliceBuffer = cmd.buffer;
+        cache.sliceOffset = cmd.offset;
+        cache.boundEpoch  = cstate.encoderEpoch;
+        cache.cmdGen      = cstate.gen;
+        cache.valid       = true;
+        D9MT_MICRO_END(17, tPushEnc);
+      } else if (pushRebind[stage]) {
+        D9MT_MICRO_BEG(tPushEnc);
+        auto& cache = dstate.pushCache[stage];
+
+        wmtcmd_render_setbuffer cmd = { };
+        cmd.type = setBufferType;
+        cmd.buffer = obj_handle_t(cache.sliceBuffer);
+        cmd.offset = cache.sliceOffset;
+        cmd.index = uint8_t(shader->pushBufferIndex);
+        d9mt::encodeRenderCmd(cstate, &cmd);
+
+        cache.boundEpoch = cstate.encoderEpoch;
         D9MT_MICRO_END(17, tPushEnc);
       }
 

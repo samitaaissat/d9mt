@@ -74,6 +74,17 @@ namespace dxvk::d9mt {
     std::vector<ShaderPushBlock>    pushBlocks;
     std::vector<ShaderSpecConstant> specConstants;
 
+    // Byte ranges of [0, pushDataSize) NOT written by the push blocks or the
+    // 2-byte sampler-index writes — precomputed so the per-draw upload zeroes
+    // only these instead of memset()ing the whole block (empty for most
+    // shaders: blocks usually cover everything).
+    std::vector<std::pair<uint16_t, uint16_t>> pushZeroRanges;
+
+    // True when every set-0 argument-buffer slot [0, abEntryCount) is written
+    // by the resources loop (with null bindings writing an explicit 0), so
+    // the per-draw AB memset can be skipped.
+    bool abFullyCovered = false;
+
     // function cache keyed by the spec-constant values (d9mt_shader.cpp)
     struct FunctionCache;
     FunctionCache* functions = nullptr;

@@ -701,6 +701,158 @@ static NTSTATUS d9mt_capture(void *args) {
   return STATUS_SUCCESS;
 }
 
+/* ---- fused render-encoder transition ------------------------------------
+ * Mirror of winemetal's WMTRenderPassInfo layout (pinned DXMT v0.80 —
+ * bump-checked against src/winemetal.h at build time by the d3d9fe build,
+ * which shares the header). Kept as a local mirror so this unixlib does not
+ * include the PE-oriented winemetal.h. */
+struct d9mt_wmt_clear_color { double r, g, b, a; };
+
+struct d9mt_wmt_color_att {
+  uint64_t texture;
+  uint32_t load_action;
+  uint32_t store_action;
+  uint16_t level;
+  uint16_t slice;
+  uint32_t depth_plane;
+  struct d9mt_wmt_clear_color clear_color;
+  uint64_t resolve_texture;
+  uint16_t resolve_level;
+  uint16_t resolve_slice;
+  uint32_t resolve_depth_plane;
+};
+
+struct d9mt_wmt_depth_att {
+  uint64_t texture;
+  uint32_t load_action;
+  uint32_t store_action;
+  uint16_t level;
+  uint16_t slice;
+  uint32_t depth_plane;
+  float clear_depth;
+};
+
+struct d9mt_wmt_stencil_att {
+  uint64_t texture;
+  uint32_t load_action;
+  uint32_t store_action;
+  uint16_t level;
+  uint16_t slice;
+  uint32_t depth_plane;
+  uint8_t clear_stencil;
+};
+
+struct d9mt_wmt_render_pass_info {
+  struct d9mt_wmt_color_att colors[8];
+  struct d9mt_wmt_depth_att depth;
+  struct d9mt_wmt_stencil_att stencil;
+  uint8_t default_raster_sample_count;
+  uint8_t render_target_array_length;
+  uint8_t tile_width;
+  uint8_t tile_height;
+  uint32_t render_target_height;
+  uint32_t render_target_width;
+  uint64_t visibility_buffer;
+};
+
+static NTSTATUS d9mt_pass_transition(void *args) {
+  struct d9mt_pass_transition_params *p = args;
+  p->ret_encoder = 0;
+
+  /* Interop invariant (probed empirically, 2026-08-14): winemetal handles
+   * ARE raw ObjC pointers — the probe logged AGXG17GFamilyCommandBuffer /
+   * AGXG17GFamilyRenderContext — so ending/creating encoders natively here
+   * interoperates with encoders/commands driven through winemetal. */
+  @autoreleasepool {
+    if (p->old_encoder) {
+      id<MTLCommandEncoder> old = (id<MTLCommandEncoder>)(uintptr_t)p->old_encoder;
+      [old endEncoding];
+      [old release]; /* balances the retain taken at creation */
+    }
+
+    if (!p->pass_ptr)
+      return STATUS_SUCCESS; /* end-only */
+
+    const struct d9mt_wmt_render_pass_info *info =
+        (const struct d9mt_wmt_render_pass_info *)(uintptr_t)p->pass_ptr;
+    id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)(uintptr_t)p->cmdbuf;
+    if (!cmdbuf)
+      return STATUS_SUCCESS;
+
+    MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+
+    for (unsigned i = 0; i < 8; i++) {
+      const struct d9mt_wmt_color_att *src = &info->colors[i];
+      if (!src->texture)
+        continue;
+      MTLRenderPassColorAttachmentDescriptor *att = desc.colorAttachments[i];
+      att.texture = (id<MTLTexture>)(uintptr_t)src->texture;
+      att.level = src->level;
+      att.slice = src->slice;
+      att.depthPlane = src->depth_plane;
+      att.loadAction = (MTLLoadAction)src->load_action;
+      att.storeAction = (MTLStoreAction)src->store_action;
+      att.clearColor = MTLClearColorMake(src->clear_color.r, src->clear_color.g,
+                                         src->clear_color.b, src->clear_color.a);
+      if (src->resolve_texture) {
+        att.resolveTexture = (id<MTLTexture>)(uintptr_t)src->resolve_texture;
+        att.resolveLevel = src->resolve_level;
+        att.resolveSlice = src->resolve_slice;
+        att.resolveDepthPlane = src->resolve_depth_plane;
+      }
+    }
+
+    if (info->depth.texture) {
+      MTLRenderPassDepthAttachmentDescriptor *att = desc.depthAttachment;
+      att.texture = (id<MTLTexture>)(uintptr_t)info->depth.texture;
+      att.level = info->depth.level;
+      att.slice = info->depth.slice;
+      att.depthPlane = info->depth.depth_plane;
+      att.loadAction = (MTLLoadAction)info->depth.load_action;
+      att.storeAction = (MTLStoreAction)info->depth.store_action;
+      att.clearDepth = info->depth.clear_depth;
+    }
+
+    if (info->stencil.texture) {
+      MTLRenderPassStencilAttachmentDescriptor *att = desc.stencilAttachment;
+      att.texture = (id<MTLTexture>)(uintptr_t)info->stencil.texture;
+      att.level = info->stencil.level;
+      att.slice = info->stencil.slice;
+      att.depthPlane = info->stencil.depth_plane;
+      att.loadAction = (MTLLoadAction)info->stencil.load_action;
+      att.storeAction = (MTLStoreAction)info->stencil.store_action;
+      att.clearStencil = info->stencil.clear_stencil;
+    }
+
+    if (info->render_target_width) {
+      desc.renderTargetWidth = info->render_target_width;
+      desc.renderTargetHeight = info->render_target_height;
+    }
+    if (info->render_target_array_length)
+      desc.renderTargetArrayLength = info->render_target_array_length;
+    if (info->default_raster_sample_count)
+      desc.defaultRasterSampleCount = info->default_raster_sample_count;
+    if (info->visibility_buffer)
+      desc.visibilityResultBuffer = (id<MTLBuffer>)(uintptr_t)info->visibility_buffer;
+
+    id<MTLRenderCommandEncoder> enc = [cmdbuf renderCommandEncoderWithDescriptor:desc];
+    if (!enc)
+      return STATUS_SUCCESS; /* ret_encoder stays 0; caller logs */
+
+    if (p->end_immediately) {
+      [enc endEncoding];
+      /* autoreleased; pool drains it — nothing escapes */
+      p->ret_encoder = 0;
+      /* poke a non-zero marker so the caller can distinguish success from
+       * encoder-creation failure for clear passes */
+      p->padding = 1;
+    } else {
+      p->ret_encoder = (uint64_t)(uintptr_t)[enc retain];
+    }
+  }
+  return STATUS_SUCCESS;
+}
+
 typedef NTSTATUS (*unixlib_entry_t)(void *args);
 
 __attribute__((visibility("default")))
@@ -710,6 +862,7 @@ const unixlib_entry_t __wine_unix_call_funcs[D9MT_FUNC_COUNT] = {
     d9mt_library_for_key,
     d9mt_hud_set_color,
     d9mt_capture,
+    d9mt_pass_transition,
 };
 
 /* identical param layouts for 32-bit callers (see header ABI rule) */
@@ -720,4 +873,5 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[D9MT_FUNC_COUNT] = {
     d9mt_library_for_key,
     d9mt_hud_set_color,
     d9mt_capture,
+    d9mt_pass_transition,
 };

@@ -107,6 +107,12 @@ i686-w64-mingw32-gcc -O2 \
   "$ROOT/test/bench.c" \
   -ld3d9 -luser32 -lgdi32
 
+echo "[build] compiling capstest.exe (i686 PE, no shader blobs)"
+i686-w64-mingw32-gcc -O2 \
+  -o "$BUILD/capstest.exe" \
+  "$ROOT/test/capstest.c" \
+  -ld3d9 -luser32 -lgdi32
+
 # shader test apps need SM3 bytecode produced by hlsl2dxso.exe under wine
 # (test/<name>_*.hlsl); each is skipped if its blobs are absent
 embed_blob() { # <blob> <header> <symbol>
@@ -141,6 +147,37 @@ build_shader_test texquad
 # stage; regenerate with tools/hlsl2dxso.exe under wine)
 build_shader_test fogtest
 build_shader_test multisampler
+
+# consttest: constant-staleness readback (vs_2_0 + two ps_2_0 blobs from
+# test/consttest_*.hlsl, generated with tools/hlsl2dxso.exe under wine)
+if [[ -f "$BUILD/consttest_vs.vso" && -f "$BUILD/consttest_psc.pso" \
+   && -f "$BUILD/consttest_pst.pso" ]]; then
+  echo "[build] embedding consttest bytecode + compiling consttest.exe"
+  embed_blob "$BUILD/consttest_vs.vso"  "$BUILD/consttest_vs_bytecode.h"  consttest_vs_bytecode
+  embed_blob "$BUILD/consttest_psc.pso" "$BUILD/consttest_psc_bytecode.h" consttest_psc_bytecode
+  embed_blob "$BUILD/consttest_pst.pso" "$BUILD/consttest_pst_bytecode.h" consttest_pst_bytecode
+  i686-w64-mingw32-gcc -O2 \
+    -o "$BUILD/consttest.exe" \
+    "$ROOT/test/consttest.c" \
+    -I "$BUILD" \
+    -ld3d9 -luser32 -lgdi32
+fi
+
+# spectest: numeric-fidelity readback of the REAL WoW 3.3.5 terrain sun-
+# specular shaders. The blobs are game content (never committed) — extract
+# with tools/extract-wow-shaders.py and copy:
+#   shaders_vertex_vs_2_0_terrain.vs20.4.vso  -> $BUILD/spectest_vs.vso
+#   shaders_pixel_ps_2_0_terrain1.ps20.0.pso  -> $BUILD/spectest_ps.pso
+if [[ -f "$BUILD/spectest_vs.vso" && -f "$BUILD/spectest_ps.pso" ]]; then
+  echo "[build] embedding spectest bytecode + compiling spectest.exe"
+  embed_blob "$BUILD/spectest_vs.vso" "$BUILD/spectest_vs_bytecode.h" spectest_vs_bytecode
+  embed_blob "$BUILD/spectest_ps.pso" "$BUILD/spectest_ps_bytecode.h" spectest_ps_bytecode
+  i686-w64-mingw32-gcc -O2 \
+    -o "$BUILD/spectest.exe" \
+    "$ROOT/test/spectest.c" \
+    -I "$BUILD" \
+    -ld3d9 -luser32 -lgdi32
+fi
 
 echo "[build] compiling extest.exe"
 i686-w64-mingw32-gcc -O2 \

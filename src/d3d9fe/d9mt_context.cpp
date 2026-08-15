@@ -182,6 +182,20 @@ namespace dxvk::d9mt {
     // immutable process-global buffer, so re-emitting it on every resDirty
     // draw is pure arena traffic — bind once per (encoder, stage, index)
     int32_t lastSamplerHeap[2] = { -1, -1 };
+    // Per-slot vertex-buffer bind shadow (WWDC21 session 10148, redundant
+    // bindings). updateVertexBufferBindings re-emits EVERY binding whenever
+    // GpDirtyVertexBuffers fires, and that flag is a whole-layout bit: a
+    // SetStreamSource on stream 0, or an input-layout change that moved
+    // nothing, re-binds every stream. Encoder-scoped like lastRenderPso —
+    // Metal encoder state does not survive its encoder, so the shadow is
+    // cleared wherever those are.
+    static constexpr uint32_t MaxVertexBindShadow = 32u;
+    struct VertexBindShadow {
+      uint64_t buffer = 0;
+      uint64_t offset = 0;
+    };
+    VertexBindShadow lastVertexBind[MaxVertexBindShadow] = { };
+    uint32_t vertexBindEpoch = ~0u;  // encoderEpoch the shadow describes
     // resources already made resident on the current render encoder. Flat
     // open-addressing set (see ResidentSet): markResident is called for every
     // bound resource of every draw, so the per-insert node allocation of a
@@ -3321,9 +3335,12 @@ namespace dxvk {
 
     // Cross-format size-compatible copies (Vulkan raw-bit semantics):
     // alias the DESTINATION subresource with the source's pixel format via
-    // a transient texture view (plain color images are created with
-    // PixelFormatView usage, resources decision 3). Depth/BC/MSAA aliasing
-    // is not possible on Metal — fail loud.
+    // a transient texture view. Colour images only carry PixelFormatView
+    // usage when they can genuinely be reinterpreted (resources stage,
+    // WWDC21 session 10148 lossless-compression rule), so the alias can
+    // legitimately fail here — in that case the copy detours through a
+    // scratch texture that IS aliasable instead of being dropped.
+    // Depth/BC/MSAA aliasing is not possible on Metal at all — fail loud.
     bool crossFormat = srcCaps->wmtFormat != dstCaps->wmtFormat;
 
     if (crossFormat) {
@@ -3356,12 +3373,19 @@ namespace dxvk {
       WMTTextureSwizzleRed, WMTTextureSwizzleGreen,
       WMTTextureSwizzleBlue, WMTTextureSwizzleAlpha };
 
+    // Tracked up front, not after the loop: the cross-format path can bail out
+    // mid-loop with earlier layers already encoded, and those commands
+    // reference both images. Tracking early only extends lifetime.
+    m_cmd->track(dstImage, DxvkAccess::Write);
+    m_cmd->track(srcImage, DxvkAccess::Read);
+
     for (uint32_t layer = 0; layer < dstSubresource.layerCount; layer++) {
       obj_handle_t dstHandle = obj_handle_t(dstImage->handle());
       uint32_t dstLevel = dstSubresource.mipLevel;
       uint32_t dstSlice = dstSubresource.baseArrayLayer + layer;
 
       obj_handle_t aliasView = 0;
+      obj_handle_t scratch   = 0;
 
       if (crossFormat) {
         // view scoped to the destination subresource, in the source format
@@ -3370,15 +3394,77 @@ namespace dxvk {
           srcCaps->wmtFormat, WMTTextureType2D,
           dstLevel, 1u, dstSlice, 1u, identity, &gpuResourceId);
 
-        if (!aliasView) {
-          Logger::err("d9mt: copyImage: format alias view creation failed "
-            "(destination lacks PixelFormatView usage?)");
-          return;
-        }
+        if (aliasView) {
+          dstHandle = aliasView;
+          dstLevel = 0u;
+          dstSlice = 0u;
+        } else {
+          // Destination is not aliasable (no PixelFormatView usage). Detour
+          // through a scratch texture that is: copy src -> scratch aliased in
+          // the source format, then scratch -> dst as a same-format copy.
+          // Both hops are raw-bit copies, so the result is identical.
+          WMTTextureInfo si = { };
+          si.pixel_format       = dstCaps->wmtFormat;
+          si.width              = extent.width;
+          si.height             = extent.height;
+          si.depth              = 1u;
+          si.array_length       = 1u;
+          si.type               = WMTTextureType2D;
+          si.mipmap_level_count = 1u;
+          si.sample_count       = 1u;
+          si.usage              = WMTTextureUsage(WMTTextureUsageShaderRead
+                                | WMTTextureUsagePixelFormatView);
+          si.options            = WMTResourceStorageModePrivate;
 
-        dstHandle = aliasView;
-        dstLevel = 0u;
-        dstSlice = 0u;
+          scratch = MTLDevice_newTexture(d9mt::mtlDevice(), &si);
+
+          obj_handle_t scratchAlias = scratch
+            ? MTLTexture_newTextureView(scratch, srcCaps->wmtFormat,
+                WMTTextureType2D, 0u, 1u, 0u, 1u, identity, &gpuResourceId)
+            : 0;
+
+          if (!scratchAlias) {
+            Logger::err("d9mt: copyImage: cross-format copy failed "
+              "(no aliasable destination and no scratch texture)");
+
+            if (scratch)
+              NSObject_release(scratch);
+
+            return;
+          }
+
+          wmtcmd_blit_copy_from_texture_to_texture toScratch = { };
+          toScratch.type = WMTBlitCommandCopyFromTextureToTexture;
+          toScratch.src = obj_handle_t(srcImage->handle());
+          toScratch.src_slice = srcSubresource.baseArrayLayer + layer;
+          toScratch.src_level = srcSubresource.mipLevel;
+          toScratch.src_origin = { uint64_t(srcOffset.x), uint64_t(srcOffset.y), uint64_t(srcOffset.z) };
+          toScratch.src_size = { extent.width, extent.height, extent.depth };
+          toScratch.dst = scratchAlias;
+          toScratch.dst_slice = 0u;
+          toScratch.dst_level = 0u;
+          toScratch.dst_origin = { 0u, 0u, 0u };
+          d9mt::encodeBlitCmd(state, &toScratch);
+
+          NSObject_release(scratchAlias);
+
+          // second hop is same-format: copy the whole scratch into place
+          wmtcmd_blit_copy_from_texture_to_texture cmd = { };
+          cmd.type = WMTBlitCommandCopyFromTextureToTexture;
+          cmd.src = scratch;
+          cmd.src_slice = 0u;
+          cmd.src_level = 0u;
+          cmd.src_origin = { 0u, 0u, 0u };
+          cmd.src_size = { extent.width, extent.height, extent.depth };
+          cmd.dst = obj_handle_t(dstImage->handle());
+          cmd.dst_slice = dstSlice;
+          cmd.dst_level = dstLevel;
+          cmd.dst_origin = { uint64_t(dstOffset.x), uint64_t(dstOffset.y), uint64_t(dstOffset.z) };
+          d9mt::encodeBlitCmd(state, &cmd);
+
+          NSObject_release(scratch);
+          continue;
+        }
       }
 
       wmtcmd_blit_copy_from_texture_to_texture cmd = { };
@@ -3398,9 +3484,6 @@ namespace dxvk {
       if (aliasView)
         NSObject_release(aliasView);
     }
-
-    m_cmd->track(dstImage, DxvkAccess::Write);
-    m_cmd->track(srcImage, DxvkAccess::Read);
   }
 
 
@@ -4199,24 +4282,41 @@ namespace dxvk {
   void DxvkContext::setViewports(
           uint32_t            viewportCount,
     const DxvkViewport*       viewports) {
+    // Redundant-binding elision (WWDC21 session 10148): the d3d9 front-end
+    // re-binds the viewport whenever its own dirty bit fires, and that bit is
+    // re-armed by things that usually do not move the rect at all (every
+    // SetRenderTarget, every scissor toggle). Each of those no-op calls used
+    // to re-emit SetViewport AND SetScissorRect into the command arena. Every
+    // other dynamic-state setter here compares first; this one did not.
+    bool changed = viewportCount != m_state.vp.viewportCount;
+
     for (uint32_t i = 0; i < viewportCount; i++) {
-      m_state.vp.viewports[i] = viewports[i].viewport;
-      m_state.vp.scissorRects[i] = viewports[i].scissor;
+      VkViewport viewport = viewports[i].viewport;
+      VkRect2D   scissor  = viewports[i].scissor;
 
       // Vulkan viewports are not allowed to have a width or
       // height of zero, so we fall back to a dummy viewport
       // and instead set an empty scissor rect, which is legal.
-      if (viewports[i].viewport.width <= 0.0f || viewports[i].viewport.height == 0.0f) {
-        m_state.vp.viewports[i] = VkViewport {
-          0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
-        m_state.vp.scissorRects[i] = VkRect2D {
+      if (viewport.width <= 0.0f || viewport.height == 0.0f) {
+        viewport = VkViewport { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+        scissor  = VkRect2D {
           VkOffset2D { 0, 0 },
           VkExtent2D { 0, 0 } };
       }
+
+      changed |= std::memcmp(&m_state.vp.viewports[i], &viewport, sizeof(viewport)) != 0
+              || std::memcmp(&m_state.vp.scissorRects[i], &scissor, sizeof(scissor)) != 0;
+
+      m_state.vp.viewports[i] = viewport;
+      m_state.vp.scissorRects[i] = scissor;
     }
 
     m_state.vp.viewportCount = viewportCount;
-    m_flags.set(DxvkContextFlag::GpDirtyViewport);
+
+    // A pass restart re-dirties this flag independently, so eliding the
+    // no-op set can never leave a fresh encoder without its viewport.
+    if (changed)
+      m_flags.set(DxvkContextFlag::GpDirtyViewport);
   }
 
 
@@ -4680,6 +4780,8 @@ namespace dxvk {
     cstate.lastSamplerHeap[0] = -1;
     cstate.lastSamplerHeap[1] = -1;
     cstate.renderResident.reset();
+    // (lastVertexBind self-invalidates on encoderEpoch — see
+    // updateVertexBufferBindings)
 
     // restart active occlusion queries into a fresh visibility slot of the
     // new encoder (queries span pass splits by accumulating GPU queries)
@@ -4821,6 +4923,14 @@ namespace dxvk {
     D9MT_ZONE(d9mt::ZoneVtxBind);
     auto& cstate = d9mt::cmdListState(m_cmd.ptr());
 
+    // The shadow only describes the CURRENT render encoder: a fresh encoder
+    // starts with no buffers bound, so drop it whenever the epoch moves.
+    // (One bump site — cmdListBeginRenderPass — so this cannot miss one.)
+    if (cstate.vertexBindEpoch != cstate.encoderEpoch) {
+      std::memset(cstate.lastVertexBind, 0, sizeof(cstate.lastVertexBind));
+      cstate.vertexBindEpoch = cstate.encoderEpoch;
+    }
+
     for (uint32_t i = 0; i < m_state.gp.state.il.bindingCount(); i++) {
       uint32_t binding = m_state.gp.state.ilBindings[i].binding();
       const auto& slice = m_state.vi.vertexBuffers[binding];
@@ -4834,6 +4944,20 @@ namespace dxvk {
         // null stream / unbound binding: nullDescriptor semantics (reads
         // return zero) via the context zero buffer + Constant step layout
         info = this->createZeroBuffer(4096u)->getSliceInfo();
+      }
+
+      // Already bound to this slot on this encoder? Skip the re-bind. The
+      // track() above still ran, so residency and lifetime are unaffected —
+      // only the redundant arena command goes away.
+      if (likely(binding < d9mt::CmdListState::MaxVertexBindShadow)) {
+        auto& shadow = cstate.lastVertexBind[binding];
+
+        if (shadow.buffer == uint64_t(info.buffer)
+         && shadow.offset == uint64_t(info.offset))
+          continue;
+
+        shadow.buffer = uint64_t(info.buffer);
+        shadow.offset = uint64_t(info.offset);
       }
 
       wmtcmd_render_setbuffer cmd = { };

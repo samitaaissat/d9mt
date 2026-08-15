@@ -27,6 +27,10 @@
 
 #include <algorithm>
 #include <cfloat>
+
+// d9mt: dev-only micro-probes (pass-3 W2 attribution). Compiles to nothing
+// under D9MT_NO_TRACE (RELEASE). Path is relative to this vendored dir.
+#include "../../../../src/d3d9fe/d9mt_trace.h"
 #ifdef MSC_VER
 #pragma fenv_access (on)
 #endif
@@ -3037,13 +3041,19 @@ namespace dxvk {
           UINT             NumVertices,
           UINT             StartIndex,
           UINT             PrimitiveCount) {
+    D9MT_MICRO_BEG(tFeDraw); // d9mt: W2 attribution probe (slot 20)
+
     D3D9DeviceLock lock = LockDevice();
 
-    if (unlikely(m_state.vertexDecl == nullptr))
+    if (unlikely(m_state.vertexDecl == nullptr)) {
+      D9MT_MICRO_END(20, tFeDraw); // d9mt
       return D3DERR_INVALIDCALL;
+    }
 
-    if (unlikely(!PrimitiveCount))
+    if (unlikely(!PrimitiveCount)) {
+      D9MT_MICRO_END(20, tFeDraw); // d9mt
       return S_OK;
+    }
 
     bool dynamicSysmemVBOs;
     bool dynamicSysmemIBO;
@@ -3080,6 +3090,7 @@ namespace dxvk {
       ctx->drawIndexed(1u, &draw);
     });
 
+    D9MT_MICRO_END(20, tFeDraw); // d9mt
     return D3D_OK;
   }
 
@@ -5384,8 +5395,12 @@ namespace dxvk {
           DWORD                   Flags) {
     D3D9DeviceLock lock = LockDevice();
 
-    if (unlikely(ppbData == nullptr))
+    D9MT_MICRO_BEG(tFeLock); // d9mt: W2 attribution probe (slot 18)
+
+    if (unlikely(ppbData == nullptr)) {
+      D9MT_MICRO_END(18, tFeLock); // d9mt
       return D3DERR_INVALIDCALL;
+    }
 
     if (unlikely(!m_d3d9Options.allowDiscard))
       Flags &= ~D3DLOCK_DISCARD;
@@ -5485,8 +5500,10 @@ namespace dxvk {
 
       if (!skipWait) {
         const Rc<DxvkBuffer> mappingBuffer = pResource->GetBuffer<D3D9_COMMON_BUFFER_TYPE_MAPPING>();
-        if (!WaitForResource(*mappingBuffer, pResource->GetMappingBufferSequenceNumber(), Flags))
+        if (!WaitForResource(*mappingBuffer, pResource->GetMappingBufferSequenceNumber(), Flags)) {
+          D9MT_MICRO_END(18, tFeLock); // d9mt
           return D3DERR_WASSTILLDRAWING;
+        }
 
         pResource->SetNeedsReadback(false);
       }
@@ -5510,6 +5527,7 @@ namespace dxvk {
     // Unmap textures if the amount of mapped texture memory is exceeding the threshold.
     UnmapTextures();
 
+    D9MT_MICRO_END(18, tFeLock); // d9mt
     return D3D_OK;
   }
 
@@ -5556,27 +5574,38 @@ namespace dxvk {
         D3D9CommonBuffer*       pResource) {
     D3D9DeviceLock lock = LockDevice();
 
-    if (pResource->DecrementLockCount() != 0)
+    D9MT_MICRO_BEG(tFeUnlk); // d9mt: W2 attribution probe (slot 19)
+
+    if (pResource->DecrementLockCount() != 0) {
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt
       return D3D_OK;
+    }
 
     // Nothing else to do for directly mapped buffers. Those were already written.
-    if (pResource->GetMapMode() != D3D9_COMMON_BUFFER_MAP_MODE_BUFFER)
+    if (pResource->GetMapMode() != D3D9_COMMON_BUFFER_MAP_MODE_BUFFER) {
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt
       return D3D_OK;
+    }
 
     // There is no part of the buffer that hasn't been uploaded yet.
     // This shouldn't happen.
-    if (pResource->DirtyRange().IsDegenerate())
+    if (pResource->DirtyRange().IsDegenerate()) {
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt
       return D3D_OK;
+    }
 
     pResource->SetMapFlags(0);
 
     // Only D3DPOOL_DEFAULT buffers get uploaded in UnlockBuffer.
     // D3DPOOL_SYSTEMMEM and D3DPOOL_MANAGED get uploaded at draw time.
-    if (pResource->Desc()->Pool != D3DPOOL_DEFAULT)
+    if (pResource->Desc()->Pool != D3DPOOL_DEFAULT) {
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt
       return D3D_OK;
+    }
 
     FlushBuffer(pResource);
 
+    D9MT_MICRO_END(19, tFeUnlk); // d9mt
     return D3D_OK;
   }
 
@@ -5789,11 +5818,15 @@ namespace dxvk {
 
 
   void D3D9DeviceEx::EmitCsChunk(DxvkCsChunkRef&& chunk) {
+    D9MT_MICRO_BEG(tCsPush); // d9mt: W2 attribution probe (slot 21)
+
     // Flush init commands so that the CS thread
     // can processe them before the first use.
     m_initializer->FlushCsChunk();
 
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
+
+    D9MT_MICRO_END(21, tCsPush); // d9mt
   }
 
 

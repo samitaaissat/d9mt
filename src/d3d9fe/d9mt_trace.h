@@ -164,7 +164,7 @@ namespace dxvk::d9mt {
     std::atomic<uint64_t> count { 0 };
   };
 
-  static constexpr uint32_t MicroCount = 20;
+  static constexpr uint32_t MicroCount = 24;
 
   inline MicroAccum* microTable() {
     static MicroAccum t[MicroCount] = {};
@@ -175,7 +175,9 @@ namespace dxvk::d9mt {
     static const char* const n[MicroCount] = {
       "look", "ctxLk", "rt", "cmdLk", "rpRst", "spec", "psoSt",
       "setPso", "vtx", "idx", "dyn", "bindRes",
-      "abAlloc", "abLoop", "abEnc", "push", "smpLoop", "pushEnc", "m18", "m19",
+      "abAlloc", "abLoop", "abEnc", "push", "smpLoop", "pushEnc",
+      // d9mt pass-3 W2 attribution: front-end app-thread lock/draw loop probes
+      "feLock", "feUnlk", "feDraw", "csPush", "m22", "m23",
     };
     return i < MicroCount ? n[i] : "?";
   }

@@ -97,173 +97,22 @@ namespace dxvk {
 
 
     // -----------------------------------------------------------------------
-    // Lossless compression policy (WWDC21 session 10148, "Optimize high-end
-    // games for Apple GPUs")
-    //
-    // Apple GPUs lossless-compress a texture when it is stored from tile to
-    // device memory, but the pixelFormatView / shaderWrite / unknown usage
-    // flags opt the texture OUT of it, so every one of those flags is paid
-    // for in bandwidth on every store. Apple's rule is to set pixelFormatView
-    // only for a genuine component-layout reinterpretation — never merely to
-    // reorder components (pass a swizzle to newTextureView instead), and
-    // never for a plain linear <-> sRGB view.
-    //
-    // The sRGB half of that rule is stated in the session but NOT in the
-    // MTLTextureUsage reference docs, and getting it wrong costs black
-    // textures rather than frames. So neither source is taken on faith:
-    // probe the running OS once with a throwaway 1x1 texture and let the
-    // answer pick the policy. Same spirit as the session itself — measure,
-    // don't assume.
+    // pixelFormatView usage policy — REVERTED to v4's blanket-permissive
+    // behaviour. WWDC21 session 10148 proposed narrowing this to only
+    // genuinely-reinterpreted textures, to restore Apple GPU lossless
+    // compression on the rest; that narrowing shipped as payload v5 and was
+    // reverted in v6 after a live regression report: a previously-fixed
+    // projected-texture/ground-decal clipping bug came back. No confirmed
+    // single mechanism was traced despite an extensive investigation —
+    // including empirical Metal probes on real hardware for every candidate
+    // raised — so rather than keep guessing against a live regression, the
+    // narrowing itself is reverted wholesale. See
+    // docs/gpu-optimization-wwdc21-10148.md for the investigation.
     // -----------------------------------------------------------------------
-
-    // The sRGB counterpart of every uncompressed colour format the d3d9
-    // front-end can put in an image's view-format list. (MTLPixelFormat
-    // numbers each _sRGB variant immediately after its linear form, but the
-    // pairs are spelled out rather than derived so an unrelated format can
-    // never be mistaken for a counterpart.)
-    bool d9mtIsSrgbCounterpart(WMTPixelFormat a, WMTPixelFormat b) {
-      // Swizzle-marker composites (winemetal.h WMTPixelFormatCustomSwizzle)
-      // would compare equal after the ORIGINAL_FORMAT masking below, so two
-      // formats differing ONLY in marker bits would be taken for an sRGB pair
-      // and wrongly lose the flag. No such value is reachable today — the
-      // g_formatCaps table holds plain enums only — so this is a guard against
-      // a future entry, and it fails the safe way (not a pair -> flag kept).
-      if (a != ORIGINAL_FORMAT(a) || b != ORIGINAL_FORMAT(b))
-        return false;
-
-      auto linearOf = [] (WMTPixelFormat f) {
-        switch (ORIGINAL_FORMAT(f)) {
-          case WMTPixelFormatR8Unorm_sRGB:    return WMTPixelFormatR8Unorm;
-          case WMTPixelFormatRG8Unorm_sRGB:   return WMTPixelFormatRG8Unorm;
-          case WMTPixelFormatRGBA8Unorm_sRGB: return WMTPixelFormatRGBA8Unorm;
-          case WMTPixelFormatBGRA8Unorm_sRGB: return WMTPixelFormatBGRA8Unorm;
-          default: return WMTPixelFormat(ORIGINAL_FORMAT(f));
-        }
-      };
-
-      return a != b && linearOf(a) == linearOf(b);
-    }
-
-
-    // Does this OS refuse a linear <-> sRGB texture view unless the texture
-    // carries pixelFormatView usage? Probed once, on the real device.
-    bool d9mtSrgbViewNeedsPixelFormatView() {
-      static const bool s_needed = [] () -> bool {
-        obj_handle_t device = d9mt::mtlDevice();
-
-        if (!device)
-          return true; // no device to ask: keep the permissive flag
-
-        WMTTextureInfo info = { };
-        info.pixel_format       = WMTPixelFormatBGRA8Unorm;
-        info.width              = 1u;
-        info.height             = 1u;
-        info.depth              = 1u;
-        info.array_length       = 1u;
-        info.type               = WMTTextureType2D;
-        info.mipmap_level_count = 1u;
-        info.sample_count       = 1u;
-        info.usage              = WMTTextureUsageShaderRead;
-        info.options            = WMTResourceStorageModePrivate;
-
-        obj_handle_t probe = MTLDevice_newTexture(device, &info);
-
-        if (!probe)
-          return true;
-
-        uint64_t gpuResourceId = 0u;
-        obj_handle_t view = MTLTexture_newTextureView(probe,
-          WMTPixelFormatBGRA8Unorm_sRGB, WMTTextureType2D,
-          0u, 1u, 0u, 1u, d9mtIdentitySwizzle(), &gpuResourceId);
-
-        bool needed = !view;
-
-        if (view)
-          NSObject_release(view);
-
-        NSObject_release(probe);
-
-        Logger::info(needed
-          ? "d9mt: sRGB views need pixelFormatView on this OS "
-            "(colour textures stay lossless-uncompressed)"
-          : "d9mt: sRGB views work without pixelFormatView "
-            "(lossless compression kept on colour textures)");
-
-        return needed;
-      } ();
-
-      return s_needed;
-    }
-
-
-    // D9MT_PIXELFORMATVIEW=1 restores the old blanket usage (every plain
-    // colour texture aliasable) if a narrowing regression ever shows up in
-    // the field.
-    bool d9mtForcePixelFormatView() {
-      static const bool s_force = [] () -> bool {
-        const char* env = std::getenv("D9MT_PIXELFORMATVIEW");
-        return env && env[0] == '1';
-      } ();
-
-      return s_force;
-    }
-
-
-    // Whether a texture genuinely needs pixelFormatView usage, from what is
-    // known at creation time. Only MUTABLE_FORMAT images can be viewed with a
-    // different format at all, and the formats in question arrive as a
-    // VkImageFormatListCreateInfo chained by allocateStorageWithUsage. The
-    // d3d9 front-end's sole mutable case is the linear/sRGB pair, so on an OS
-    // that allows sRGB views without the flag no d3d9 texture needs it.
-    //
-    // Cross-format copyImage aliases are NOT a reason to set it here: those
-    // route through a scratch texture when the destination turns out not to
-    // be aliasable (see DxvkContext::copyImage).
     bool d9mtNeedsPixelFormatView(
-      const VkImageCreateInfo&  createInfo,
-            WMTPixelFormat      baseFormat) {
-      if (d9mtForcePixelFormatView())
-        return true;
-
-      if (!(createInfo.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
-        return false;
-
-      const VkImageFormatListCreateInfo* formatList = nullptr;
-
-      for (auto* next = reinterpret_cast<const VkBaseInStructure*>(createInfo.pNext);
-           next; next = next->pNext) {
-        if (next->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
-          formatList = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
-          break;
-        }
-      }
-
-      // Mutable but no list of what it will be viewed as: stay permissive.
-      if (!formatList || !formatList->viewFormatCount)
-        return true;
-
-      bool reinterprets = false;
-      bool srgbOnly     = true;
-
-      for (uint32_t i = 0; i < formatList->viewFormatCount; i++) {
-        const auto* viewCaps = d9mt::lookupFormatCaps(formatList->pViewFormats[i]);
-
-        if (!viewCaps || viewCaps->wmtFormat == WMTPixelFormatInvalid)
-          return true; // unknown view format: stay permissive
-
-        if (viewCaps->wmtFormat == baseFormat)
-          continue;
-
-        reinterprets = true;
-
-        if (!d9mtIsSrgbCounterpart(baseFormat, viewCaps->wmtFormat))
-          srgbOnly = false;
-      }
-
-      if (!reinterprets)
-        return false;
-
-      return srgbOnly ? d9mtSrgbViewNeedsPixelFormatView() : true;
+      const VkImageCreateInfo&  /*createInfo*/,
+            WMTPixelFormat      /*baseFormat*/) {
+      return true;
     }
 
     // Maps the VkFormat's component order onto the Metal storage format's

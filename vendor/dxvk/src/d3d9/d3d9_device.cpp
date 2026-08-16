@@ -2448,10 +2448,17 @@ namespace dxvk {
         case D3DRS_SPECULARMATERIALSOURCE:
         case D3DRS_EMISSIVEMATERIALSOURCE:
         case D3DRS_COLORVERTEX:
-        case D3DRS_LIGHTING:
         case D3DRS_NORMALIZENORMALS:
         case D3DRS_LOCALVIEWER:
           m_flags.set(D3D9DeviceFlag::DirtyFFVertexShader);
+          break;
+
+        case D3DRS_LIGHTING:
+          m_flags.set(D3D9DeviceFlag::DirtyFFVertexShader);
+          // d9mt pass 3: cold lights are VIEW-baked; a lighting toggle must
+          // force the cold re-upload — a VIEW change while lighting was off
+          // may have skipped it.
+          m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
           break;
 
         case D3DRS_AMBIENT:

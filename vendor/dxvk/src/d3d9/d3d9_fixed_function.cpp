@@ -339,7 +339,7 @@ namespace dxvk {
   }
 
 
-  std::pair<uint32_t, uint32_t> SetupRenderStateBlock(SpirvModule& spvModule, uint32_t samplerMask) {
+  std::pair<uint32_t, uint32_t> SetupRenderStateBlock(SpirvModule& spvModule, uint32_t samplerMask, bool ffVertexTransforms) {
     uint32_t floatType = spvModule.defFloatType(32);
     uint32_t uintType  = spvModule.defIntType(32, 0);
     uint32_t vec3Type  = spvModule.defVectorType(floatType, 3);
@@ -361,6 +361,15 @@ namespace dxvk {
 
     // Number of static data members
     uint32_t rsMemberCount = rsMembers.size();
+
+    // d9mt pass 3: hot FF VS transform matrices live in the push block.
+    if (ffVertexTransforms) {
+      uint32_t vec4Type = spvModule.defVectorType(floatType, 4);
+      uint32_t mat4Type = spvModule.defMatrixType(vec4Type, 4);
+      rsMembers.push_back(mat4Type); // member 11: WorldView    @ 64
+      rsMembers.push_back(mat4Type); // member 12: NormalMatrix @ 128
+      rsMembers.push_back(mat4Type); // member 13: InverseView  @ 192
+    }
 
     // Add one dword for each sampler pair
     uint32_t samplerCount = bit::popcnt(samplerMask);
@@ -396,6 +405,18 @@ namespace dxvk {
     SetMemberName("point_scale_a",  offsetof(D3D9RenderStateInfo, pointScaleA));
     SetMemberName("point_scale_b",  offsetof(D3D9RenderStateInfo, pointScaleB));
     SetMemberName("point_scale_c",  offsetof(D3D9RenderStateInfo, pointScaleC));
+
+    // d9mt pass 3: decorate the hot transform members (11-13) appended above.
+    if (ffVertexTransforms) {
+      static const char* const names[3] = { "worldview", "normal_matrix", "inverse_view" };
+      for (uint32_t i = 0; i < 3; i++) {
+        spvModule.setDebugMemberName   (rsStruct, memberIdx, names[i]);
+        spvModule.memberDecorateOffset (rsStruct, memberIdx, 64 + i * 64);
+        spvModule.memberDecorateMatrixStride(rsStruct, memberIdx, 16);
+        spvModule.memberDecorate       (rsStruct, memberIdx, spv::DecorationRowMajor);
+        memberIdx++;
+      }
+    }
 
     uint32_t samplerOffset = GetPushSamplerOffset(0u);
 
@@ -809,7 +830,7 @@ namespace dxvk {
 
     void compileVS();
 
-    void setupRenderStateInfo(VkShaderStageFlagBits stage, uint32_t samplerCount);
+    void setupRenderStateInfo(VkShaderStageFlagBits stage, uint32_t samplerCount, bool ffVertexTransforms = false);
 
     void emitLightTypeDecl();
 
@@ -873,6 +894,7 @@ namespace dxvk {
     uint32_t              m_mainFuncLabel   = 0u;
 
     DxvkPushDataBlock     m_samplerBlock;
+    DxvkPushDataBlock     m_vsTransformBlock;
 
     D3D9FixedFunctionOptions m_options;
 
@@ -959,7 +981,7 @@ namespace dxvk {
     info.outputMask = m_outputMask;
     info.flatShadingInputs = m_flatShadingMask;
     info.sharedPushData = DxvkPushDataBlock(0u, sizeof(D3D9RenderStateInfo), 4u, 0u);
-    info.localPushData = m_samplerBlock;
+    info.localPushData = isVS() ? m_vsTransformBlock : m_samplerBlock;
     info.samplerHeap = DxvkShaderBinding(VK_SHADER_STAGE_ALL, GetGlobalSamplerSetIndex(), 0u);
 
     return new DxvkShader(info, m_module.compile());
@@ -1478,8 +1500,8 @@ namespace dxvk {
   }
 
 
-  void D3D9FFShaderCompiler::setupRenderStateInfo(VkShaderStageFlagBits stage, uint32_t samplerCount) {
-    auto blockInfo = SetupRenderStateBlock(m_module, (1u << samplerCount) - 1u);
+  void D3D9FFShaderCompiler::setupRenderStateInfo(VkShaderStageFlagBits stage, uint32_t samplerCount, bool ffVertexTransforms) {
+    auto blockInfo = SetupRenderStateBlock(m_module, (1u << samplerCount) - 1u, ffVertexTransforms);
 
     m_rsBlock = blockInfo.first;
     m_rsFirstSampler = blockInfo.second;
@@ -1730,7 +1752,12 @@ namespace dxvk {
 
 
   void D3D9FFShaderCompiler::setupVS() {
-    setupRenderStateInfo(VK_SHADER_STAGE_VERTEX_BIT, 0u);
+    setupRenderStateInfo(VK_SHADER_STAGE_VERTEX_BIT, 0u, /*ffVertexTransforms=*/true);
+
+    // d9mt pass 3: VS-local transform block, dst offset 64, 3x mat4.
+    m_vsTransformBlock = DxvkPushDataBlock(VK_SHADER_STAGE_VERTEX_BIT,
+      64u, 3u * 64u, 16u, 0u);
+
     m_specUbo = SetupSpecUBO(m_module, m_bindings);
 
     // VS Caps
@@ -1751,9 +1778,19 @@ namespace dxvk {
         m_module.opAccessChain(typePtr, m_vs.constantBuffer, 1, &offset));
     };
 
-    m_vs.constants.worldview = LoadConstant(m_mat4Type, uint32_t(D3D9FFVSMembers::WorldViewMatrix));
-    m_vs.constants.normal    = LoadConstant(m_mat4Type, uint32_t(D3D9FFVSMembers::NormalMatrix));
-    m_vs.constants.inverseView = LoadConstant(m_mat4Type, uint32_t(D3D9FFVSMembers::InverseViewMatrix));
+    // d9mt pass 3: hot matrices come from the push block (members 11-13),
+    // not the FF constant UBO. The UBO members remain (layout unchanged)
+    // but are never written — only cold members are uploaded now.
+    auto LoadPushMat4 = [&](uint32_t member) {
+      uint32_t idx     = m_module.constu32(member);
+      uint32_t typePtr = m_module.defPointerType(m_mat4Type, spv::StorageClassPushConstant);
+      return m_module.opLoad(m_mat4Type,
+        m_module.opAccessChain(typePtr, m_rsBlock, 1u, &idx));
+    };
+
+    m_vs.constants.worldview    = LoadPushMat4(11u);
+    m_vs.constants.normal       = LoadPushMat4(12u);
+    m_vs.constants.inverseView  = LoadPushMat4(13u);
     m_vs.constants.proj      = LoadConstant(m_mat4Type, uint32_t(D3D9FFVSMembers::ProjMatrix));
 
     for (uint32_t i = 0; i < caps::TextureStageCount; i++)

@@ -75,6 +75,7 @@ namespace dxvk {
     DirtyFogEnd,
 
     DirtyFFVertexData,
+    DirtyFFTransforms,
     DirtyFFVertexBlend,
     DirtyFFVertexShader,
     DirtyFFPixelShader,

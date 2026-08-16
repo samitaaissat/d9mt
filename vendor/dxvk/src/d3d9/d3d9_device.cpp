@@ -183,6 +183,7 @@ namespace dxvk {
     m_flags.set(D3D9DeviceFlag::DirtyFogEnd);
 
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexBlend);
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexShader);
     m_flags.set(D3D9DeviceFlag::DirtyFFPixelShader);
@@ -2073,7 +2074,12 @@ namespace dxvk {
 
     m_state.transforms[idx] = m_state.transforms[idx] * ConvertMatrix(pMatrix);
 
-    m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    // d9mt pass 3: VIEW/WORLD matrices feed the hot push path;
+    // PROJECTION/TEXTUREn still live in the cold FF UBO.
+    if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
+      m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
+    else
+      m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
 
     if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexBlend);
@@ -4603,7 +4609,12 @@ namespace dxvk {
 
     m_state.transforms[idx] = ConvertMatrix(pMatrix);
 
-    m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    // d9mt pass 3: VIEW/WORLD matrices feed the hot push path;
+    // PROJECTION/TEXTUREn still live in the cold FF UBO.
+    if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
+      m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
+    else
+      m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
 
     if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexBlend);
@@ -8156,19 +8167,36 @@ namespace dxvk {
       m_viewportInfo.inverseOffset = m_viewportInfo.inverseOffset + Vector4(-1.0f, 1.0f, 0.0f, 0.0f);
     }
 
+    // d9mt pass 3: hot transforms bypass the renamed FF UBO — one push
+    // into the VS per-stage push region (offset 64, members 11-13).
+    if (m_flags.test(D3D9DeviceFlag::DirtyFFTransforms)) {
+      m_flags.clr(D3D9DeviceFlag::DirtyFFTransforms);
+
+      struct FFTransformPush {
+        Matrix4 worldView;
+        Matrix4 normal;
+        Matrix4 inverseView;
+      };
+
+      FFTransformPush t;
+      t.worldView   = m_state.transforms[GetTransformIndex(D3DTS_VIEW)] * m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
+      t.normal      = inverse(t.worldView);
+      t.inverseView = transpose(inverse(m_state.transforms[GetTransformIndex(D3DTS_VIEW)]));
+
+      EmitCs([cData = t](DxvkContext* ctx) {
+        ctx->pushData(VK_SHADER_STAGE_VERTEX_BIT, 64u, uint32_t(sizeof(FFTransformPush)), &cData);
+      });
+    }
+
     // Constants...
     if (m_flags.test(D3D9DeviceFlag::DirtyFFVertexData)) {
       m_flags.clr(D3D9DeviceFlag::DirtyFFVertexData);
 
       auto mapPtr = m_vsFixedFunction.AllocSlice();
 
-      auto WorldView    = m_state.transforms[GetTransformIndex(D3DTS_VIEW)] * m_state.transforms[GetTransformIndex(D3DTS_WORLD)];
-      auto NormalMatrix = inverse(WorldView);
-
+      // d9mt pass 3: WorldView/NormalMatrix/InverseView moved to the hot
+      // push path above — the UBO members stay stale and are never read.
       D3D9FixedFunctionVS* data = reinterpret_cast<D3D9FixedFunctionVS*>(mapPtr);
-      data->WorldView    = WorldView;
-      data->NormalMatrix = NormalMatrix;
-      data->InverseView  = transpose(inverse(m_state.transforms[GetTransformIndex(D3DTS_VIEW)]));
       data->Projection   = m_state.transforms[GetTransformIndex(D3DTS_PROJECTION)];
 
       for (uint32_t i = 0; i < data->TexcoordMatrices.size(); i++)
@@ -8547,6 +8575,7 @@ namespace dxvk {
 
     rs[D3DRS_AMBIENT]                = 0;
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
 
     rs[D3DRS_FOGENABLE]                  = FALSE;
     rs[D3DRS_FOGCOLOR]                   = 0;

@@ -75,7 +75,11 @@ namespace dxvk {
 
   // Returns a render state block, as well as the index of the
   // first sampler member.
-  std::pair<uint32_t, uint32_t> SetupRenderStateBlock(SpirvModule& spvModule, uint32_t samplerMask);
+  // ffVertexTransforms (FF VS only, requires samplerMask == 0): append the
+  // three hot per-draw matrices as push members at byte offsets 64/128/192
+  // (member indices 11/12/13). They replace the UBO reads of
+  // WorldView/NormalMatrix/InverseView — see pass-3 design doc.
+  std::pair<uint32_t, uint32_t> SetupRenderStateBlock(SpirvModule& spvModule, uint32_t samplerMask, bool ffVertexTransforms = false);
 
   // Returns a global sampler descriptor array
   uint32_t SetupSamplerArray(SpirvModule& spvModule);

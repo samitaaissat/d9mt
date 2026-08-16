@@ -7546,12 +7546,23 @@ namespace dxvk {
     const uint32_t usedTextureMask = m_textureSlotTracking.bound & usedSamplerMask;
 
     const uint32_t texturesToUpload = m_textureSlotTracking.needsUpload & usedTextureMask;
-    if (unlikely(texturesToUpload != 0))
-      UploadManagedTextures(texturesToUpload);
+    const uint32_t texturesToGen    = m_textureSlotTracking.needsMipGen & usedTextureMask;
 
-    const uint32_t texturesToGen = m_textureSlotTracking.needsMipGen & usedTextureMask;
-    if (unlikely(texturesToGen != 0))
-      GenerateTextureMips(texturesToGen);
+    // d9mt: particle/part-mode fast path — texture staging upload and mip
+    // regen are both no-ops once a MANAGED texture has been uploaded once
+    // (needsUpload/needsMipGen stay clear thereafter), which is the common
+    // case for a bound-but-static particle atlas redrawn every frame. One
+    // combined test replaces two independent unconditional mask computations
+    // + branches with a single check; the individual calls below are
+    // unchanged (same functions, same args, same order) when work is
+    // actually pending.
+    if (unlikely((texturesToUpload | texturesToGen) != 0)) {
+      if (texturesToUpload != 0)
+        UploadManagedTextures(texturesToUpload);
+
+      if (texturesToGen != 0)
+        GenerateTextureMips(texturesToGen);
+    }
 
     auto* ibo = GetCommonBuffer(m_state.indices);
     if (unlikely(UploadIBO && ibo != nullptr && ibo->NeedsUpload()))

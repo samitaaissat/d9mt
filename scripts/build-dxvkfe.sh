@@ -198,21 +198,39 @@ objname() { # unique object name from path relative to repo root
 PIDS=()
 FAILED=0
 NJOBS=8
-BACKEND_HDR="$ROOT/src/d3d9fe/d9mt_backend.h"
-DRAW_HDR="$ROOT/src/d3d9fe/d9mt_draw.h"
-TRACE_HDR="$ROOT/src/d3d9fe/d9mt_trace.h"
+
+# Print the prerequisites recorded in a compiler-generated .d sidecar, one
+# per line: join '\' continuations, drop everything up to the first ':' on
+# each logical line (the real rule's target; the -MP phony target lines
+# have no prerequisites and drop to nothing), split on whitespace.
+dep_prereqs() {
+  sed -e ':a' -e '/\\$/N' -e 's/\\\n/ /' -e 'ta' "$1" \
+    | sed -e 's/^[^:]*://' \
+    | tr -s ' \t' '\n' \
+    | sed -e '/^$/d'
+}
+
 compile_one() { # <src> <compiler...>
   local src="$1"; shift
-  local obj; obj="$(objname "$src")"
-  # backend TUs additionally depend on the shared backend headers
-  if [[ "$src" == "$ROOT/src/d3d9fe/"* && -f "$obj" \
-     && ( "$BACKEND_HDR" -nt "$obj" || "$DRAW_HDR" -nt "$obj" \
-          || "$TRACE_HDR" -nt "$obj" ) ]]; then
-    rm -f "$obj"
+  local obj dep; obj="$(objname "$src")"; dep="${obj%.o}.d"
+  # Header deps come from the compiler itself: every compile also writes a
+  # .d sidecar (-MMD -MP), and an obj is stale when it or its .d is
+  # missing, the source is newer, or any prerequisite in the .d is newer
+  # than the obj. This replaces the old hand-maintained header list, which
+  # silently missed vendor/ header edits. (-MP emits phony targets so a
+  # deleted header keeps the .d parseable instead of breaking it.)
+  local stale=0
+  if [[ ! -f "$obj" || ! -f "$dep" || "$src" -nt "$obj" ]]; then
+    stale=1
+  else
+    local hdr
+    while IFS= read -r hdr; do
+      if [[ "$hdr" -nt "$obj" ]]; then stale=1; break; fi
+    done < <(dep_prereqs "$dep")
   fi
-  if [[ ! -f "$obj" || "$src" -nt "$obj" ]]; then
+  if (( stale )); then
     echo "[dxvkfe] CC $(basename "$src")"
-    "$@" -c -o "$obj" "$src" || { echo "[dxvkfe] FAILED: $src"; rm -f "$obj"; return 1; }
+    "$@" -MMD -MP -c -o "$obj" "$src" || { echo "[dxvkfe] FAILED: $src"; rm -f "$obj"; return 1; }
   fi
 }
 

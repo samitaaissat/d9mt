@@ -54,6 +54,65 @@ Pass-2 baseline (payload v3, 16k draws / 256 rt round-trips):
   to the d9vk-visible identity (0x106b + Metal device name);
   D9MT_ADAPTER_SPOOF=amd restores upstream hiding; dxvk.conf wins.
 
+## Landed (pass 3, this branch)
+
+- W1 — FF hot/cold constant split + push-block transforms (9e50ea9;
+  fixes b48a0a3, 8390a36): VS WORLD/VIEW transforms move off the
+  per-draw cbuffer rename onto the push-constant path; PROJECTION,
+  TEXTUREn, and lighting/material state stay in the cold FF UBO.
+  Result: xform submit_avg_ms 55.76 -> 28.87 (-48%), 7/7 pairs,
+  dev-trace-confirmed (bufSub ~8000/frame -> 0); med_ms inconclusive
+  this session (loaded-machine confound — concurrent live wine
+  session). Design deviation from the approved spec: cold-UBO lights
+  are VIEW-baked (d3d9_state.h:84-85 — D3D9Light bakes Position/
+  Direction through viewMtx at light-set time), so a VIEW change must
+  also dirty the cold block when D3DRS_LIGHTING is on (b48a0a3), and
+  the D3DRS_LIGHTING toggle itself must dirty the cold block too, to
+  close the off->VIEW-change->on stale-light window (8390a36).
+  Semantics are exactly baseline in both fixes; the perf target
+  (WORLD-per-draw, hot path only) is untouched.
+- W2 — lock fast-path + PrepareDraw texture-mask fast path (4d7b880,
+  297b1cd; fix eb2e248): skip the bound-VB-slot walk in LockBuffer for
+  direct-mapped buffers (NeedsUpload() is provably always false for
+  them, so the FlushBuffer upload path is unreachable), and collapse
+  PrepareDraw's texture-upload/mip-gen dirty checks into one combined
+  branch — both are no-ops in the common particle-VB / static-atlas
+  case. Result: direction confirmed, ~1% RELEASE win in part mode (med
+  -0.34%, submit_avg -0.98%, n=7, robust to outlier removal); the
+  dev-trace ~10-12% prediction was inflated by rdtsc probe overhead on
+  sub-microsecond regions plus feLock/feDraw attribution overlap (Task
+  6 spillover into PrepareDraw's VB-upload-mask consumption). Task 7's
+  isolated contribution is not isolated / likely small. Cautionary
+  note on the fast-path shape: review caught the first cut computing
+  the mip-gen mask before the upload that creates it — a MANAGED +
+  AUTOGENMIPMAP texture's mip-gen bit, set inside
+  UploadManagedTextures itself, was silently dropped by the up-front
+  snapshot (a draw would have sampled stale mips). Fixed by gating on
+  the raw pre-upload masks and recomputing texturesToGen after the
+  upload runs, inside the same branch.
+- Layout constants (f0187e2, prep for W1, no behavior change on its
+  own): MaxPerStagePushDataSize 32 -> 256, MaxTotalPushDataSize 256 ->
+  1376, to hold the FF VS transform push block per stage (64B
+  rs-prefix offset + 192B matrices = 256B/stage; total = 64 shared +
+  5*256 stages + 32 reserved). pushDataBlockSrcOffset() now returns
+  the per-stage region base only; call sites add block.getOffset() for
+  the block's position within the region (srcOffset = region base +
+  block offset, matching the FE write side's
+  computePushDataBlockOffset(index) + offset memcpy).
+
+## Validation gaps (pass 3) — must close before shipping
+
+- spectest is env-blocked machine-wide this pass (no 3.3.5a client
+  reachable anywhere on this machine), so neither W1 nor W2 has
+  runnable numeric coverage: FF lighting values (the VIEW-baked cold
+  light fix, b48a0a3/8390a36) and the MANAGED+AUTOGENMIPMAP
+  upload/mip-regen path (the eb2e248 fix) both rest on verified
+  call-chain/state reasoning, not a readback test. consttest,
+  depthbias, and resettest are green on every commit in this pass but
+  exercise neither path.
+- A real-game boot test is mandatory before this payload ships — this
+  gates Task 10, not just a recommendation.
+
 ## Verified-faithful (pass 2 tests; keep green)
 
 - test/consttest.c: PS/VS constant updates, texture swaps, blend-toggle
@@ -88,6 +147,14 @@ Pass-2 baseline (payload v3, 16k draws / 256 rt round-trips):
   wine unixlib dispatch has no bounds check, so a PE calling a function
   the .so lacks executes whatever follows the call table (we lost hours
   to "black renders" and phantom asserts from exactly this).
+- Task 7 Option B (closure/chunk-count reduction in the CS enqueue
+  path): dev-trace attribution measured csPush at 0.1% of the
+  per-batch app-thread submit total (feDraw dominates at 31.4%) — dead
+  on arrival, flat before/after Task 6+7, no code changed.
+- UnmapTextures() gate in LockBuffer: already one atomic load +
+  compare (early-outs on `m_memoryAllocator.MappedMemory() <
+  textureMemory`) — inspected per the W2 (Task 6) brief, already
+  cheap, left untouched.
 
 ## Next candidates, in rough value order (all unproven until benched)
 
@@ -95,27 +162,20 @@ Pass-2 baseline (payload v3, 16k draws / 256 rt round-trips):
    port the apitrace harness (v2/scripts/run-apitrace.sh targets the
    retired v2 driver + CrossOver paths) to the shipped driver and capture
    login-screen / flight-path / particle-storm traces as reference loads.
-2. App-thread per-call cost (part mode is app-thread-bound: ~5.7us per
-   Lock+fill+draw batch in dev builds): the FE call surface itself under
-   Rosetta. Candidates: slim PrepareDraw for the dynamic-VB path, batch
-   the CS chunk enqueues, or move the Lock ring management PE-side.
-3. Per-draw FF cbuffer rename (xform mode: bufSub x8000 = 2ms/frame CS +
-   AB rebuild every draw): write FF constants into the packed slice
-   directly (skip the DxvkBuffer rename), or delta-upload transforms.
-4. Split s_compileMutex: it serializes spirv-cross codegen AND
+2. Split s_compileMutex: it serializes spirv-cross codegen AND
    newLibraryWithSource across all 4 PSO workers — area-load bursts
    degrade to ~1 effective compile thread (consttest observed its second
    trivial PSO take 13+ frames). Hold it only around the non-reentrant
    section (or key it per shader).
-5. MTLBinaryArchive L2 PSO cache (designed in SHADER-DISK-CACHE-ARCH.md,
+3. MTLBinaryArchive L2 PSO cache (designed in SHADER-DISK-CACHE-ARCH.md,
    never built): kills the per-launch PSO rebuild in prewarm and the
    first-sight mid-session compiles.
-6. Trifan index caching: WoW UI trifans regenerate an index buffer on the
+4. Trifan index caching: WoW UI trifans regenerate an index buffer on the
    CPU per draw (d9mt_context.cpp drawEmit); cache per (count, base) or
    convert at bind time.
-7. Blit-chain batching for texture-streaming bursts (winemetal already
+5. Blit-chain batching for texture-streaming bursts (winemetal already
    accepts chains; encodeBlitCmd sends one crossing per copy today).
-8. The 2-3x moonshot stays native arm64 (out-of-process command consumer
+6. The 2-3x moonshot stays native arm64 (out-of-process command consumer
    or full port) — every Rosetta-tax trim above is bounded by it.
 
 ## Benchmark discipline (hard-won)
@@ -126,6 +186,22 @@ Pass-2 baseline (payload v3, 16k draws / 256 rt round-trips):
 - Absolute numbers drift between sessions (display config, thermals,
   background load) — only within-session interleaved A/B is comparable.
 - Dev-build traces (D9MT_TRACE=1) are for RELATIVE attribution only.
+- Dev-build micro-probe (D9MT_MICRO_BEG/END) segment shares do not
+  transfer to RELEASE magnitudes: a dev-trace-predicted ~10-12% win
+  measured as ~1% in RELEASE (pass 3, W2) — the probes' own
+  QueryPerformanceCounter overhead dominates sub-microsecond regions.
+  Use dev traces for relative attribution/routing decisions only, never
+  as a magnitude forecast for a RELEASE ship decision.
+- On a noisy (shared/loaded) machine, med_ms can invert direction
+  outright (pass 3, W1: 5/7 pairs favored HEAD, the median favored base)
+  while submit_avg_ms — less exposed to present/vsync scheduling — stays
+  monotonic; treat submit_avg_ms as the trustworthy signal on a noisy
+  machine and med_ms as corroborating-only until a quiet-session
+  recheck. Interleaved same-session A/B (never cross-session absolutes)
+  remains the only comparable measurement.
+- Pair run order was fixed HEAD-then-base for both pass-3 A/Bs —
+  randomize per-pair order in future sessions to rule out a systematic
+  first-vs-second-in-pair bias.
 - Validate every change with depthbias.exe AND resettest.exe (the Reset
   ladder has caught "safe" dirty-tracking changes before) AND
   consttest.exe (constants staleness) — then a real game boot.

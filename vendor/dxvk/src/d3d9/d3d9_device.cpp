@@ -2075,8 +2075,15 @@ namespace dxvk {
     m_state.transforms[idx] = m_state.transforms[idx] * ConvertMatrix(pMatrix);
 
     // d9mt pass 3: VIEW/WORLD matrices feed the hot push path;
-    // PROJECTION/TEXTUREn still live in the cold FF UBO.
-    if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
+    // PROJECTION/TEXTUREn still live in the cold FF UBO. Cold lights are
+    // baked into VIEW space, so a VIEW change must also re-upload the
+    // cold UBO when lighting is on.
+    if (idx == GetTransformIndex(D3DTS_VIEW)) {
+      m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
+      if (m_state.renderStates[D3DRS_LIGHTING])
+        m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    }
+    else if (idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
     else
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
@@ -4610,8 +4617,15 @@ namespace dxvk {
     m_state.transforms[idx] = ConvertMatrix(pMatrix);
 
     // d9mt pass 3: VIEW/WORLD matrices feed the hot push path;
-    // PROJECTION/TEXTUREn still live in the cold FF UBO.
-    if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
+    // PROJECTION/TEXTUREn still live in the cold FF UBO. Cold lights are
+    // baked into VIEW space, so a VIEW change must also re-upload the
+    // cold UBO when lighting is on.
+    if (idx == GetTransformIndex(D3DTS_VIEW)) {
+      m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
+      if (m_state.renderStates[D3DRS_LIGHTING])
+        m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
+    }
+    else if (idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFTransforms);
     else
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);

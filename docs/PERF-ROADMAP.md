@@ -188,8 +188,8 @@ Pass-2 baseline (payload v3, 16k draws / 256 rt round-trips):
 - Dev-build traces (D9MT_TRACE=1) are for RELATIVE attribution only.
 - Dev-build micro-probe (D9MT_MICRO_BEG/END) segment shares do not
   transfer to RELEASE magnitudes: a dev-trace-predicted ~10-12% win
-  measured as ~1% in RELEASE (pass 3, W2) — the probes' own
-  QueryPerformanceCounter overhead dominates sub-microsecond regions.
+  measured as ~1% in RELEASE (pass 3, W2) — the probes' own rdtsc
+  overhead dominates sub-microsecond regions.
   Use dev traces for relative attribution/routing decisions only, never
   as a magnitude forecast for a RELEASE ship decision.
 - On a noisy (shared/loaded) machine, med_ms can invert direction

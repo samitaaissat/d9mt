@@ -326,6 +326,31 @@ namespace dxvk::d9mt {
 
         DxvkPushDataBlock block = layout.getPushDataBlock(index);
 
+        // d9mt: per-region src overflow check. The dst check below
+        // (result->pushDataSize > MaxTotalPushDataSize) only bounds the
+        // *destination* copy; it says nothing about whether a block's
+        // *source* region — read at pushDataBlockSrcOffset(index) +
+        // block.getOffset(), same formula as DxvkPushDataBlock::computeIndex
+        // — fits inside its own budget. index == 0 is always the shared
+        // region (MaxSharedPushDataSize); index >= 1 is always a single-
+        // stage region (MaxPerStagePushDataSize) — computeIndex never
+        // returns a nonzero index for a multi-stage (shared) block. The FF
+        // VS transform block sits at exactly offset 64 + size 192 = 256 ==
+        // MaxPerStagePushDataSize, which is in-bounds, so this must stay a
+        // strict '>' check.
+        {
+          uint32_t srcBudget = index == 0
+            ? uint32_t(MaxSharedPushDataSize)
+            : uint32_t(MaxPerStagePushDataSize);
+
+          if (block.getOffset() + block.getSize() > srcBudget) {
+            Logger::err(str::format("d9mt: shader push data src region exceeds ",
+              index == 0 ? "shared" : "per-stage", " budget: ",
+              block.getOffset() + block.getSize()));
+            return nullptr;
+          }
+        }
+
         ShaderPushBlock info = { };
         info.dstOffset    = block.getOffset();
         info.size         = block.getSize();

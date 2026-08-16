@@ -8074,6 +8074,23 @@ namespace dxvk {
   }
 
 
+  // d9mt: hot FF VS transform push block (see UpdateFixedFunctionVS below).
+  // Layout must stay byte-identical to the shader-side push block members
+  // appended in d3d9_fixed_function.cpp's SetupRenderStateBlock (member 11:
+  // worldview @ 64, member 12: normal_matrix @ 128, member 13: inverse_view
+  // @ 192) — these static_asserts are the tripwire if either side drifts.
+  struct FFTransformPush {
+    Matrix4 worldView;
+    Matrix4 normal;
+    Matrix4 inverseView;
+  };
+
+  static_assert(sizeof(FFTransformPush) == 192);
+  static_assert(offsetof(FFTransformPush, worldView)   == 0);
+  static_assert(offsetof(FFTransformPush, normal)      == 64);
+  static_assert(offsetof(FFTransformPush, inverseView) == 128);
+
+
   void D3D9DeviceEx::UpdateFixedFunctionVS() {
     // Shader...
     bool hasPositionT = m_state.vertexDecl != nullptr ? m_state.vertexDecl->TestFlag(D3D9VertexDeclFlag::HasPositionT) : false;
@@ -8211,12 +8228,6 @@ namespace dxvk {
     // into the VS per-stage push region (offset 64, members 11-13).
     if (m_flags.test(D3D9DeviceFlag::DirtyFFTransforms)) {
       m_flags.clr(D3D9DeviceFlag::DirtyFFTransforms);
-
-      struct FFTransformPush {
-        Matrix4 worldView;
-        Matrix4 normal;
-        Matrix4 inverseView;
-      };
 
       FFTransformPush t;
       t.worldView   = m_state.transforms[GetTransformIndex(D3DTS_VIEW)] * m_state.transforms[GetTransformIndex(D3DTS_WORLD)];

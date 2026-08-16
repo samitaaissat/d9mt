@@ -364,6 +364,13 @@ namespace dxvk {
 
     // d9mt pass 3: hot FF VS transform matrices live in the push block.
     if (ffVertexTransforms) {
+      // d9mt: member 11 (the first appended matrix, below) aliases the
+      // first sampler-pair dword's index — enforce the samplerMask == 0
+      // precondition documented on the declaration instead of letting a
+      // future FF VS + sampler combination silently collide.
+      if (samplerMask != 0)
+        throw DxvkError("SetupRenderStateBlock: ffVertexTransforms requires samplerMask == 0");
+
       uint32_t vec4Type = spvModule.defVectorType(floatType, 4);
       uint32_t mat4Type = spvModule.defMatrixType(vec4Type, 4);
       rsMembers.push_back(mat4Type); // member 11: WorldView    @ 64

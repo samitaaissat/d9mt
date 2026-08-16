@@ -5531,7 +5531,6 @@ namespace dxvk {
       const bool readOnly = Flags & D3DLOCK_READONLY;
       // NOOVERWRITE promises that they will not write in a currently used area.
       const bool noOverwrite = Flags & D3DLOCK_NOOVERWRITE;
-      const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
 
       // If we're not directly mapped, we can rely on needsReadback to tell us if a sync is required.
       const bool skipWait = (!needsReadback && (readOnly || !directMapping)) || noOverwrite;
@@ -7545,21 +7544,24 @@ namespace dxvk {
     const uint32_t usedSamplerMask = PSShaderMasks().samplerMask | VSShaderMasks().samplerMask;
     const uint32_t usedTextureMask = m_textureSlotTracking.bound & usedSamplerMask;
 
-    const uint32_t texturesToUpload = m_textureSlotTracking.needsUpload & usedTextureMask;
-    const uint32_t texturesToGen    = m_textureSlotTracking.needsMipGen & usedTextureMask;
-
     // d9mt: particle/part-mode fast path — texture staging upload and mip
     // regen are both no-ops once a MANAGED texture has been uploaded once
     // (needsUpload/needsMipGen stay clear thereafter), which is the common
-    // case for a bound-but-static particle atlas redrawn every frame. One
-    // combined test replaces two independent unconditional mask computations
-    // + branches with a single check; the individual calls below are
-    // unchanged (same functions, same args, same order) when work is
-    // actually pending.
-    if (unlikely((texturesToUpload | texturesToGen) != 0)) {
+    // case for a bound-but-static particle atlas redrawn every frame. The
+    // outer gate only tests the raw tracking masks (pre-upload) — it must
+    // NOT snapshot texturesToGen before the upload runs, because
+    // UploadManagedTextures -> UploadManagedTexture -> FlushImage can set
+    // needsMipGen bits for AUTOGENMIPMAP textures as a side effect of the
+    // upload (see MarkTextureMipsDirty, d3d9_device.cpp ~6727) that the
+    // same PrepareDraw call must still consume. So texturesToGen is
+    // (re)computed AFTER the upload, exactly as upstream ordered it —
+    // only the entry gate is new.
+    if (unlikely(((m_textureSlotTracking.needsUpload | m_textureSlotTracking.needsMipGen) & usedTextureMask) != 0)) {
+      const uint32_t texturesToUpload = m_textureSlotTracking.needsUpload & usedTextureMask;
       if (texturesToUpload != 0)
         UploadManagedTextures(texturesToUpload);
 
+      const uint32_t texturesToGen = m_textureSlotTracking.needsMipGen & usedTextureMask;
       if (texturesToGen != 0)
         GenerateTextureMips(texturesToGen);
     }

@@ -3066,12 +3066,12 @@ namespace dxvk {
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(m_state.vertexDecl == nullptr)) {
-      D9MT_MICRO_END(20, tFeDraw); // d9mt
+      D9MT_MICRO_END(20, tFeDraw); // d9mt:
       return D3DERR_INVALIDCALL;
     }
 
     if (unlikely(!PrimitiveCount)) {
-      D9MT_MICRO_END(20, tFeDraw); // d9mt
+      D9MT_MICRO_END(20, tFeDraw); // d9mt:
       return S_OK;
     }
 
@@ -3110,7 +3110,7 @@ namespace dxvk {
       ctx->drawIndexed(1u, &draw);
     });
 
-    D9MT_MICRO_END(20, tFeDraw); // d9mt
+    D9MT_MICRO_END(20, tFeDraw); // d9mt:
     return D3D_OK;
   }
 
@@ -5430,7 +5430,7 @@ namespace dxvk {
     D9MT_MICRO_BEG(tFeLock); // d9mt: W2 attribution probe (slot 18)
 
     if (unlikely(ppbData == nullptr)) {
-      D9MT_MICRO_END(18, tFeLock); // d9mt
+      D9MT_MICRO_END(18, tFeLock); // d9mt:
       return D3DERR_INVALIDCALL;
     }
 
@@ -5476,19 +5476,25 @@ namespace dxvk {
     uint32_t size   = respectUserBounds ? std::min(SizeToLock, desc.Size - offset) : desc.Size;
     D3D9Range lockRange = D3D9Range(offset, offset + size);
 
+    const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
+
     bool updateDirtyRange = (desc.Pool == D3DPOOL_DEFAULT || !(Flags & D3DLOCK_NO_DIRTY_UPDATE)) && !(Flags & D3DLOCK_READONLY);
     if (updateDirtyRange) {
       pResource->DirtyRange().Conjoin(lockRange);
 
-      for (uint32_t i : bit::BitMask(static_cast<uint32_t>(m_vbSlotTracking.bound))) {
-        auto commonBuffer = GetCommonBuffer(m_state.vertexBuffers[i].vertexBuffer);
-        if (commonBuffer == pResource) {
-          m_vbSlotTracking.needsUpload |= 1 << i;
+      // d9mt: direct-mapped buffers never take the FlushBuffer upload path
+      // (NeedsUpload() is false for them), so marking needsUpload bits is
+      // pure waste on the particle lock+fill hot path — skip the walk.
+      if (!directMapping) {
+        for (uint32_t i : bit::BitMask(static_cast<uint32_t>(m_vbSlotTracking.bound))) {
+          auto commonBuffer = GetCommonBuffer(m_state.vertexBuffers[i].vertexBuffer);
+          if (commonBuffer == pResource) {
+            m_vbSlotTracking.needsUpload |= 1 << i;
+          }
         }
       }
     }
 
-    const bool directMapping = pResource->GetMapMode() == D3D9_COMMON_BUFFER_MAP_MODE_DIRECT;
     const bool needsReadback = pResource->NeedsReadback();
 
     uint8_t* data = nullptr;
@@ -5533,7 +5539,7 @@ namespace dxvk {
       if (!skipWait) {
         const Rc<DxvkBuffer> mappingBuffer = pResource->GetBuffer<D3D9_COMMON_BUFFER_TYPE_MAPPING>();
         if (!WaitForResource(*mappingBuffer, pResource->GetMappingBufferSequenceNumber(), Flags)) {
-          D9MT_MICRO_END(18, tFeLock); // d9mt
+          D9MT_MICRO_END(18, tFeLock); // d9mt:
           return D3DERR_WASSTILLDRAWING;
         }
 
@@ -5559,7 +5565,7 @@ namespace dxvk {
     // Unmap textures if the amount of mapped texture memory is exceeding the threshold.
     UnmapTextures();
 
-    D9MT_MICRO_END(18, tFeLock); // d9mt
+    D9MT_MICRO_END(18, tFeLock); // d9mt:
     return D3D_OK;
   }
 
@@ -5609,20 +5615,20 @@ namespace dxvk {
     D9MT_MICRO_BEG(tFeUnlk); // d9mt: W2 attribution probe (slot 19)
 
     if (pResource->DecrementLockCount() != 0) {
-      D9MT_MICRO_END(19, tFeUnlk); // d9mt
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt:
       return D3D_OK;
     }
 
     // Nothing else to do for directly mapped buffers. Those were already written.
     if (pResource->GetMapMode() != D3D9_COMMON_BUFFER_MAP_MODE_BUFFER) {
-      D9MT_MICRO_END(19, tFeUnlk); // d9mt
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt:
       return D3D_OK;
     }
 
     // There is no part of the buffer that hasn't been uploaded yet.
     // This shouldn't happen.
     if (pResource->DirtyRange().IsDegenerate()) {
-      D9MT_MICRO_END(19, tFeUnlk); // d9mt
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt:
       return D3D_OK;
     }
 
@@ -5631,13 +5637,13 @@ namespace dxvk {
     // Only D3DPOOL_DEFAULT buffers get uploaded in UnlockBuffer.
     // D3DPOOL_SYSTEMMEM and D3DPOOL_MANAGED get uploaded at draw time.
     if (pResource->Desc()->Pool != D3DPOOL_DEFAULT) {
-      D9MT_MICRO_END(19, tFeUnlk); // d9mt
+      D9MT_MICRO_END(19, tFeUnlk); // d9mt:
       return D3D_OK;
     }
 
     FlushBuffer(pResource);
 
-    D9MT_MICRO_END(19, tFeUnlk); // d9mt
+    D9MT_MICRO_END(19, tFeUnlk); // d9mt:
     return D3D_OK;
   }
 
@@ -5858,7 +5864,7 @@ namespace dxvk {
 
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
 
-    D9MT_MICRO_END(21, tCsPush); // d9mt
+    D9MT_MICRO_END(21, tCsPush); // d9mt:
   }
 
 

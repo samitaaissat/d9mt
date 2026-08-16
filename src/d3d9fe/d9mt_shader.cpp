@@ -181,9 +181,10 @@ namespace dxvk::d9mt {
 
   namespace {
 
-    // shared-block source offset in m_state.pc.constantData for a given
-    // push data block index (same formula as the private static
-    // DxvkContext::computePushDataBlockOffset)
+    // per-stage-region base source offset in m_state.pc.constantData for a
+    // given push data block index (same formula as the private static
+    // DxvkContext::computePushDataBlockOffset); the call site adds
+    // block.getOffset() for the block's offset within the region
     uint32_t pushDataBlockSrcOffset(uint32_t index) {
       return index
         ? MaxSharedPushDataSize + MaxPerStagePushDataSize * (index - 1u)
@@ -328,7 +329,11 @@ namespace dxvk::d9mt {
         ShaderPushBlock info = { };
         info.dstOffset    = block.getOffset();
         info.size         = block.getSize();
-        info.srcOffset    = pushDataBlockSrcOffset(index);
+        // d9mt: region base + block offset — matches the FE write side
+        // (DxvkContext::pushData memcpy at computePushDataBlockOffset(index)
+        // + offset). No-op for today's blocks: shared has offset 0 and the
+        // per-stage sampler blocks are fully resource-masked (never copied).
+        info.srcOffset    = pushDataBlockSrcOffset(index) + block.getOffset();
         info.resourceMask = block.getResourceDwordMask();
         result->pushBlocks.push_back(info);
 

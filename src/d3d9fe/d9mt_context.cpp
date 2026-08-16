@@ -1614,7 +1614,7 @@ namespace dxvk::d9mt {
       uint32_t     boundEpoch   = 0;   // encoderEpoch the binding was emitted on
       uint32_t     cmdGen       = 0;   // CmdListState::gen of the last upload
       bool         valid        = false;
-      alignas(8) uint8_t shadow[256];  // MaxTotalPushDataSize
+      alignas(8) uint8_t shadow[MaxTotalPushDataSize];
     };
     PushBindCache pushCache[2];
   };

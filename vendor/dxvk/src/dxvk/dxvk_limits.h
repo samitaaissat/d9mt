@@ -19,9 +19,12 @@ namespace dxvk {
     MaxNumSpecConstants         =    12,
     MaxUniformBufferSize        = 65536,
     MaxVertexBindingStride      =  2048,
-    MaxTotalPushDataSize        =   256,
+    // d9mt: per-stage regions hold the FF VS transform push block
+    // (64B rs-prefix offset + 192B matrices = 256B per stage).
+    // Total = 64 shared + 5*256 stages + 32 reserved = 1376.
+    MaxTotalPushDataSize        =  1376,
     MaxSharedPushDataSize       =    64,
-    MaxPerStagePushDataSize     =    32,
+    MaxPerStagePushDataSize     =   256,
     MaxReservedPushDataSize     =    32,
   };
   

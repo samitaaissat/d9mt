@@ -32,7 +32,9 @@
 #include "d9mt_backend.h"
 #include "d9mt_hud.h"
 
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <sys/stat.h>
@@ -243,6 +245,241 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
   color.rgb = apply_gamma(color.rgb, ramp);
   return color;
 }
+
+// ===========================================================================
+// HDR present: ITU-R BT.2446 Method A inverse tone mapping, operated in
+// ICtCp (BT.2100).
+//
+// Derived from mtld3d v0.6.0 (unix/unix/src/metal/present.msl),
+// Copyright (c) 2026 Alexander Theissen, zlib licence. ALTERED SOURCE:
+// re-targeted onto d9mt's blitter vertex stage, buffer bindings and
+// source-rect UV mapping; the PQ output tail is an addition; mtld3d's SDR copy
+// entry point and its Rust host side were not ported.
+// See THIRD_PARTY_NOTICES.md.
+//
+// PROVENANCE, stated precisely, because the upstream comment is inaccurate.
+// mtld3d's own header says this is ported from "the ICtCp branch of Bt2446A"
+// in Lilium's ReShade HDR shaders and that the matrices come from Lilium's
+// colour_space.fxh. Checked against that upstream, both claims are wrong:
+//   * Lilium's Bt2446A has only LUMINANCE and YCBCR_LIKE modes -- there is no
+//     ICtCp branch. Its one ICtCp inverse tone mapper is a different algorithm
+//     (Itmos::Dice) with a shoulder early-out and a different chroma
+//     correction (min(min(I1/I2, I2/I1)*1.1, 1)) than the i_ratio scale here.
+//   * The matrix values differ from Lilium's at the 4th-5th significant digit
+//     (BT.709->LMS 0.2958197875977 vs 0.295764088; ICtCp->LMS-PQ 0.00860903 vs
+//     0.00860647484), i.e. independently derived. The one exact match is the
+//     forward LMS-PQ->ICtCp table, which is the verbatim BT.2100 published
+//     matrix that Lilium also copied from the standard.
+// What does coincide with Lilium is the quadratic-inversion line and the
+// three-way branch order. Those constants are mechanically forced by inverting
+// the piecewise published in ITU-R BT.2446-A section 6.1 (see the derivation
+// at the call site), and the branch order is the defensive one: the published
+// segment bounds do not tile exactly in float, so testing the outer segments
+// first and letting the middle one be the fallback is what avoids an
+// unmatched input.
+//
+// Lilium's ReShade HDR shaders are GPL-3.0, and mtld3d ships no Lilium notice.
+// THIRD_PARTY_NOTICES.md records the analysis; the licensing question is NOT
+// settled by this comment and gates any public push of this branch.
+//
+// The BT.709<->LMS and LMS-PQ<->ICtCp matrices and the PQ OETF/EOTF constants
+// are ITU-R BT.2100 / SMPTE ST.2084 standard values.
+//
+// Design: docs/superpowers/specs/2026-08-17-hdr-bt2446-design.md
+// ===========================================================================
+
+// Byte-identical to mtld3d's HdrUniforms. `p_hdr` is never read by the
+// shader (log2_p_hdr and inv_p_minus_one are its CPU-hoisted forms) but is
+// kept so the block matches the reference layout exactly.
+struct d9mt_hdr_params {
+  float l_hdr_nits;      // live EDR headroom * D9MT_L_SDR
+  float p_hdr;           // 1 + 32*pow(l_hdr_nits/10000, 1/2.4)  [unread]
+  float log2_p_hdr;      // log2(p_hdr)    -- replaces a pow()
+  float inv_p_minus_one; // 1/(p_hdr - 1)  -- replaces a divide
+};
+
+// Reference / diffuse white in nits. Pinned to 100 (NOT the scRGB-conventional
+// 80): Apple's compositor anchors 1.0-in-the-drawable to 100 nits and reports
+// EDR headroom as a multiplier of that same 100-nit reference. Any other value
+// puts the BT.2446-A normalisation out of phase with the compositor.
+constant float D9MT_L_SDR = 100.0f;
+
+// BT.2446 pSDR at the SDR reference. mtld3d's literals, kept verbatim for
+// look-parity with the build the user tested and approved -- and kept as
+// COMPILE-TIME CONSTANTS rather than uniforms for the same reason: as
+// constants the compiler folds the reciprocal and the (P_SDR-1) product,
+// and under fast-math a runtime-uniform form lands on measurably different
+// last bits (a GPU A/B against the reference shader showed ~3e-4 relative
+// drift on grey, amplified by the ICtCp round-trip). Parity is the point.
+//
+// Note they are NOT self-consistent: 1 + 32*pow(100/10000, 1/2.4) evaluates
+// to 5.6969576564, and ln(5.4395284707) is 1.6936924, not 1.6937747. The
+// shipped pair corresponds to ~87.35 nits of paper white and runs the curve
+// 2-5% darker through the midtones. Do not "correct" them: they ARE the
+// approved look.
+constant float D9MT_P_SDR     = 5.4395284707f;
+constant float D9MT_LOG_P_SDR = 1.6937747f;   // natural log, NOT log2
+
+// sRGB EOTF, IEC 61966-2-1 piecewise. NOT the pow(x, 2.2) shortcut: at EDR
+// brightness its ~2% midtone error is visible.
+inline float3 d9mt_srgb_eotf(float3 c) {
+  return select(pow((c + 0.055f) / 1.055f, float3(2.4f)),
+                c / 12.92f,
+                c <= float3(0.04045f));
+}
+
+// BT.709 linear-light -> LMS (BT.709 -> BT.2020 -> LMS, folded).
+// Column-major, per MSL's float3x3(col0, col1, col2).
+constant float3x3 D9MT_M_BT709_TO_LMS = float3x3(
+    float3(0.2958197875977f, 0.1562652587891f, 0.0351760864258f),
+    float3(0.6230921020508f, 0.7272338867188f, 0.1564789062500f),
+    float3(0.0810847778320f, 0.1164960937500f, 0.8083459472656f));
+
+constant float3x3 D9MT_M_LMS_TO_BT709 = float3x3(
+    float3( 6.1729507446289f, -1.3236293334961f, -0.0118084289551f),
+    float3(-5.3198394775391f,  2.5602416992188f, -0.2641143798828f),
+    float3( 0.1465606689453f, -0.2363464355469f,  1.2761764526367f));
+
+// LMS-PQ <-> ICtCp, BT.2100-2 section 3.4. MATCHED /4096 PAIR. A /8192-form
+// forward (half these Ct/Cp values) against this /4096 inverse silently drops
+// chromatic deltas by ~50% — invisible on grey (Ct=Cp=0), catastrophic on
+// saturated content. This was a shipped bug in mtld3d; do not mix forms.
+// test/hdrcurve.cpp asserts the round-trip specifically to catch it.
+constant float3x3 D9MT_M_LMS_PQ_TO_ICTCP = float3x3(
+    float3(0.5f,  1.61370003f,  4.37806224f),
+    float3(0.5f, -3.32339620f, -4.24553966f),
+    float3(0.0f,  1.70969617f, -0.13252264f));
+
+constant float3x3 D9MT_M_ICTCP_TO_LMS_PQ = float3x3(
+    float3(1.0f, 1.0f, 1.0f),
+    float3(0.00860903f, -0.00860903f,  0.56003270f),
+    float3(0.11102963f, -0.11102963f, -0.32062717f));
+
+// ST.2084 inverse EOTF: linear nits (0..10000) -> PQ-encoded [0..1].
+inline float3 d9mt_pq_oetf(float3 nits) {
+  constexpr float M1 = 2610.0f / 16384.0f;
+  constexpr float M2 = 2523.0f / 4096.0f * 128.0f;
+  constexpr float C1 = 3424.0f / 4096.0f;
+  constexpr float C2 = 2413.0f / 4096.0f * 32.0f;
+  constexpr float C3 = 2392.0f / 4096.0f * 32.0f;
+  float3 y = pow(max(nits, float3(0.0f)) / 10000.0f, float3(M1));
+  return pow((float3(C1) + C2 * y) / (float3(1.0f) + C3 * y), float3(M2));
+}
+
+// ST.2084 forward EOTF: PQ-encoded [0..1] -> linear nits.
+inline float3 d9mt_pq_eotf(float3 pq) {
+  constexpr float M1 = 2610.0f / 16384.0f;
+  constexpr float M2 = 2523.0f / 4096.0f * 128.0f;
+  constexpr float C1 = 3424.0f / 4096.0f;
+  constexpr float C2 = 2413.0f / 4096.0f * 32.0f;
+  constexpr float C3 = 2392.0f / 4096.0f * 32.0f;
+  float3 e   = pow(max(pq, float3(0.0f)), float3(1.0f / M2));
+  float3 num = max(e - float3(C1), float3(0.0f));
+  float3 den = max(float3(C2) - C3 * e, float3(1e-20f));
+  return 10000.0f * pow(num / den, float3(1.0f / M1));
+}
+
+// BT.2446-A inverse curve in ICtCp.
+// Input : linear BT.709, 1.0 = paper white.
+// Output: linear BT.709 in ABSOLUTE NITS (shared by the scRGB and PQ tails).
+inline float3 d9mt_bt2446a_ictcp(float3 lin, constant d9mt_hdr_params& u) {
+  // --- luminance curve ---
+  // Forward: encode SDR luminance through the BT.2446-A log curve at the SDR
+  // reference (P_SDR), invert the piecewise, then DEcode through the same log
+  // curve at the HDR target (p_hdr, from live headroom). Both halves are
+  // required; collapsing them is not the same function.
+  float y_sdr  = max(dot(lin, float3(0.2126f, 0.7152f, 0.0722f)), 1e-20f);
+  float yp_sdr = pow(y_sdr, 1.0f / 2.4f);
+  float yp_c   = log((yp_sdr * (D9MT_P_SDR - 1.0f)) + 1.0f) / D9MT_LOG_P_SDR;
+
+  // Three-segment inversion of BT.2446-A's forward piecewise:
+  //   Y'c = 1.0770 Y'p                            for Y'p <= 0.7399
+  //   Y'c = -1.1510 Y'p^2 + 2.7811 Y'p - 0.6302   for 0.7399 < Y'p < 0.9909
+  //   Y'c = 0.5 Y'p + 0.5                         for Y'p >= 0.9909
+  // The literal 4.83307641 - 4.604*Y'c is the discriminant
+  // 2.7811^2 - 4*1.1510*(0.6302 + Y'c); the minus root is correct because the
+  // parabola's vertex (Y'p = 1.2081) lies right of the segment's domain.
+  float yp_0 = yp_c / 1.0770f;
+  float yp_1 = (-2.7811f + sqrt(4.83307641f - 4.604f * yp_c)) / -2.302f;
+  float yp_2 = (yp_c - 0.5f) / 0.5f;
+  float yp_p = yp_0 <= 0.7399f ? yp_0 : (yp_2 >= 0.9909f ? yp_2 : yp_1);
+
+  // Inverse of the log encoding at the HDR target:
+  //   yp_hdr = (p_hdr^yp_p - 1) / (p_hdr - 1)
+  // written with the CPU-hoisted log2/reciprocal so the GPU does one exp2.
+  float yp_hdr = (exp2(yp_p * u.log2_p_hdr) - 1.0f) * u.inv_p_minus_one;
+  float y_hdr  = pow(yp_hdr, 2.4f) * u.l_hdr_nits;
+
+  // --- chroma, carried through ICtCp ---
+  // Multiply by L_SDR to enter the absolute-nits domain PQ expects.
+  float3 lms_nits = D9MT_M_BT709_TO_LMS * (lin * D9MT_L_SDR);
+  float3 lms_pq   = d9mt_pq_oetf(lms_nits);
+  float3 ictcp_in = D9MT_M_LMS_PQ_TO_ICTCP * lms_pq;
+
+  float  i_hdr   = d9mt_pq_oetf(float3(y_hdr)).x;
+  // NOTE: mtld3d's Rust doc comments claim chroma passes through untouched;
+  // the shipped MSL scales Ct/Cp by this ratio. The MSL is the tested
+  // artifact, so the multiply is what we port. Without it, saturated content
+  // (fire, spell effects) bleaches as luminance is lifted.
+  float  i_ratio = i_hdr / max(ictcp_in.x, 1e-6f);
+  float3 ictcp_out = float3(i_hdr, ictcp_in.y * i_ratio, ictcp_in.z * i_ratio);
+
+  float3 lms_pq_out   = D9MT_M_ICTCP_TO_LMS_PQ * ictcp_out;
+  float3 lms_nits_out = d9mt_pq_eotf(lms_pq_out);
+  // The only gamut handling in the pass: a hard per-channel clamp to zero.
+  // The ICtCp round-trip plus float-truncated matrices push saturated
+  // primaries slightly negative (worst case ~-10% of peak on pure green);
+  // clipping is a mild hue shift, not a visible artifact.
+  return max(D9MT_M_LMS_TO_BT709 * lms_nits_out, float3(0.0f));
+}
+
+// Selected when the layer is HDR but live headroom is <= 1.0 (macOS has not
+// promoted the screen yet, or the window sits on an SDR display). BT.2446-A is
+// NOT identity at L_hdr == L_sdr — it under-corrects by ~28% at mid grey — so
+// this is a separate pipeline, not BT.2446 with a no-op target.
+fragment float4 d9mt_blit_ps_hdr_passthrough(
+    d9mt_blit_vout in [[stage_in]],
+    constant d9mt_blit_params& p [[buffer(0)]],
+    texture2d<float> src [[texture(0)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 c = src.sample(s, p.uv_offset + in.uv * p.uv_scale);
+  return float4(d9mt_srgb_eotf(c.rgb), c.a);
+}
+
+// Extended-linear output: linear BT.709 primaries, 1.0 = D9MT_L_SDR nits.
+// The layer's extended-linear colorspace tag performs the gamut handling and
+// display encoding. This is the mtld3d-parity path.
+fragment float4 d9mt_blit_ps_hdr_bt2446(
+    d9mt_blit_vout in [[stage_in]],
+    constant d9mt_blit_params& p [[buffer(0)]],
+    texture2d<float> src [[texture(0)]],
+    constant d9mt_hdr_params& u [[buffer(2)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 c = src.sample(s, p.uv_offset + in.uv * p.uv_scale);
+  float3 nits = d9mt_bt2446a_ictcp(d9mt_srgb_eotf(c.rgb), u);
+  return float4(nits / D9MT_L_SDR, c.a);
+}
+
+// PQ / HDR10 output (NOT mtld3d parity — mtld3d never uses PQ). BT.709 nits ->
+// BT.2020 primaries -> ST.2084 encode, for a layer tagged
+// kCGColorSpaceITUR_2100_PQ. macOS then applies its own PQ->display mapping,
+// which will NOT match the extended-linear look above.
+constant float3x3 D9MT_M_BT709_TO_BT2020 = float3x3(
+    float3(0.6274039f, 0.0690973f, 0.0163914f),
+    float3(0.3292830f, 0.9195404f, 0.0880133f),
+    float3(0.0433131f, 0.0113623f, 0.8955953f));
+
+fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
+    d9mt_blit_vout in [[stage_in]],
+    constant d9mt_blit_params& p [[buffer(0)]],
+    texture2d<float> src [[texture(0)]],
+    constant d9mt_hdr_params& u [[buffer(2)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 c = src.sample(s, p.uv_offset + in.uv * p.uv_scale);
+  float3 nits2020 = D9MT_M_BT709_TO_BT2020
+                  * d9mt_bt2446a_ictcp(d9mt_srgb_eotf(c.rgb), u);
+  return float4(d9mt_pq_oetf(clamp(nits2020, 0.0f, 10000.0f)), c.a);
+}
 )";
 
     std::mutex   s_blitMutex;
@@ -253,10 +490,22 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
     obj_handle_t s_blitPsPoint = 0;
     obj_handle_t s_blitPsGamma = 0;
     obj_handle_t s_blitPsPointGamma = 0;
+    obj_handle_t s_blitPsHdrPassthrough = 0;
+    obj_handle_t s_blitPsHdrBt2446 = 0;
+    obj_handle_t s_blitPsHdrBt2446Pq = 0;
     std::vector<std::pair<uint32_t, obj_handle_t>> s_blitPsoCache;
 
+    // d9mtmetal ABI handshake result, smuggled out of the newLibrary call.
+    // 0 until the blit library has been built once; see the comment on
+    // d9mt_newlibrary_params::abi_func_count. Anything using a call code above
+    // D9MT_FUNC_PASS_TRANSITION MUST gate on this -- wine's unix dispatch has
+    // no bounds check, so calling into an older .so executes whatever bytes
+    // follow its table.
+    std::atomic<uint32_t> s_d9mtmetalFuncCount = { 0u };
+
     bool ensureBlitFunctionsLocked() {
-      if (s_blitVs && s_blitPs && s_blitPsGamma && s_blitPsPointGamma)
+      if (s_blitVs && s_blitPs && s_blitPsPoint && s_blitPsGamma && s_blitPsPointGamma
+       && s_blitPsHdrPassthrough && s_blitPsHdrBt2446 && s_blitPsHdrBt2446Pq)
         return true;
       if (s_blitInitFailed)
         return false;
@@ -274,6 +523,12 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
       lp.fast_math  = 1u;
 
       int st = D9MT_UnixCall(D9MT_FUNC_NEW_LIBRARY_FROM_SOURCE, &lp);
+
+      // ABI handshake: a d9mtmetal.so built with the HDR entry points writes
+      // its D9MT_FUNC_COUNT here; an older one leaves the zero-initialised
+      // field alone. Recorded even on the failure path -- the .so answered.
+      s_d9mtmetalFuncCount.store(lp.abi_func_count, std::memory_order_relaxed);
+
       if (st != 0 || !lp.ret_library) {
         Logger::err("d9mt: blitter: newLibraryWithSource failed");
         logf("d9mt: blitter: newLibraryWithSource status %d", st);
@@ -291,8 +546,12 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
       s_blitPsPoint = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_point");
       s_blitPsGamma = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_gamma");
       s_blitPsPointGamma = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_point_gamma");
+      s_blitPsHdrPassthrough = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_passthrough");
+      s_blitPsHdrBt2446 = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446");
+      s_blitPsHdrBt2446Pq = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446_pq");
 
-      if (!s_blitVs || !s_blitPs || !s_blitPsPoint || !s_blitPsGamma || !s_blitPsPointGamma) {
+      if (!s_blitVs || !s_blitPs || !s_blitPsPoint || !s_blitPsGamma || !s_blitPsPointGamma
+       || !s_blitPsHdrPassthrough || !s_blitPsHdrBt2446 || !s_blitPsHdrBt2446Pq) {
         Logger::err("d9mt: blitter: blit functions missing from compiled library");
         s_blitInitFailed = true;
         return false;
@@ -304,10 +563,18 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
 
   // non-static: also used by DxvkContext::blitImageView / copyImage /
   // resolveImage (declared in d9mt_backend.h)
-  obj_handle_t getBlitPso(WMTPixelFormat dstFormat, bool pointFilter, bool useGamma) {
+  obj_handle_t getBlitPso(WMTPixelFormat dstFormat, bool pointFilter, bool useGamma,
+                          HdrMode hdrMode) {
     std::lock_guard<std::mutex> lock(s_blitMutex);
 
-    uint32_t key = uint32_t(dstFormat) | (pointFilter ? 0x80000000u : 0u) | (useGamma ? 0x40000000u : 0u);
+    // dstFormat maxes out at 236, so bits 8-29 were free; hdrMode takes 28-29
+    // and leaves the existing bit-31/30 meanings untouched. With
+    // hdrMode == None the key is bit-identical to the pre-HDR one, which is
+    // what keeps the SDR PSO cache unchanged.
+    uint32_t key = uint32_t(dstFormat)
+                 | (uint32_t(hdrMode) << 28)
+                 | (pointFilter ? 0x80000000u : 0u)
+                 | (useGamma ? 0x40000000u : 0u);
 
     for (const auto& e : s_blitPsoCache) {
       if (e.first == key)
@@ -326,8 +593,18 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
     info.depth_pixel_format = WMTPixelFormatInvalid;
     info.stencil_pixel_format = WMTPixelFormatInvalid;
     info.vertex_function = s_blitVs;
-    info.fragment_function = useGamma ? (pointFilter ? s_blitPsPointGamma : s_blitPsGamma)
-                                      : (pointFilter ? s_blitPsPoint : s_blitPs);
+    // HDR variants are present-only and always linearly filtered, so they do
+    // not multiply with pointFilter/useGamma (gamma is mutually exclusive with
+    // HDR -- see DxvkSwapchainBlitter::present).
+    switch (hdrMode) {
+      case HdrMode::Passthrough: info.fragment_function = s_blitPsHdrPassthrough; break;
+      case HdrMode::Bt2446:      info.fragment_function = s_blitPsHdrBt2446;      break;
+      case HdrMode::Bt2446Pq:    info.fragment_function = s_blitPsHdrBt2446Pq;    break;
+      case HdrMode::None:
+        info.fragment_function = useGamma ? (pointFilter ? s_blitPsPointGamma : s_blitPsGamma)
+                                          : (pointFilter ? s_blitPsPoint : s_blitPs);
+        break;
+    }
     info.input_primitive_topology = WMTPrimitiveTopologyClassTriangle;
     info.max_tessellation_factor = 16; // Metal default; 0 trips validation
 
@@ -348,6 +625,227 @@ fragment float4 d9mt_blit_ps_point_gamma(d9mt_blit_vout in [[stage_in]],
   WMTPixelFormat wmtFormatFor(VkFormat format) {
     const FormatCaps* caps = lookupFormatCaps(format);
     return caps ? caps->wmtFormat : WMTPixelFormatInvalid;
+  }
+
+
+  // ==========================================================================
+  // HDR present state.
+  //
+  // Ported from mtld3d v0.6.0 (unix/unix/src/metal/{present,command,macdrv}.rs),
+  // Copyright (c) 2026 Alexander Theissen, zlib licence. ALTERED SOURCE: the
+  // capability gate, the 32-present refresh cadence and the uniform derivation
+  // are re-expressed in C++ against winemetal/d9mtmetal instead of mtld3d's
+  // own unix half. See THIRD_PARTY_NOTICES.md.
+  //
+  // Design: docs/superpowers/specs/2026-08-17-hdr-bt2446-design.md
+  // ==========================================================================
+
+  namespace {
+
+    enum class HdrEnv : uint32_t { Off = 0, On = 1, Auto = 2 };
+    enum class HdrSpace : uint32_t { Display = 0, ScRgb = 1, Pq = 2 };
+
+    std::atomic<bool>  s_hdrActive  = { false };
+    std::atomic<float> s_hdrPeak    = { 1.0f };
+    std::atomic<bool>  s_hdrLatched = { false };   // gate has been evaluated
+    HdrSpace           s_hdrSpace   = HdrSpace::Display;
+
+    bool envFlagEquals(const char* name, const char* value) {
+      const char* v = std::getenv(name);
+      return v && std::strcmp(v, value) == 0;
+    }
+
+    HdrEnv hdrEnvMode() {
+      static const HdrEnv mode = [] {
+        const char* v = std::getenv("D9MT_HDR");
+        // Default OFF for this drop: the user A/Bs by relaunching, and a
+        // regression cannot cost them a raid night. Flip to Auto once
+        // in-game parity against mtld3d is signed off.
+        if (!v)
+          return HdrEnv::Off;
+        if (!std::strcmp(v, "1") || !std::strcmp(v, "on"))   return HdrEnv::On;
+        if (!std::strcmp(v, "auto"))                          return HdrEnv::Auto;
+        return HdrEnv::Off;
+      }();
+      return mode;
+    }
+
+    HdrSpace hdrEnvSpace() {
+      static const HdrSpace space = [] {
+        // Display = the panel's own profile, extended-linearized. This is
+        // mtld3d's `color.space = passthrough` default and therefore what the
+        // approved look was tested against.
+        if (envFlagEquals("D9MT_HDR_COLORSPACE", "scrgb")) return HdrSpace::ScRgb;
+        if (envFlagEquals("D9MT_HDR_COLORSPACE", "pq"))    return HdrSpace::Pq;
+        return HdrSpace::Display;
+      }();
+      return space;
+    }
+
+    // Debug override: pin the curve's peak instead of following the display.
+    float hdrEnvPeakOverride() {
+      static const float peak = [] {
+        const char* v = std::getenv("D9MT_HDR_PEAK");
+        double d = v ? std::atof(v) : 0.0;
+        return (d > 1.0 && d < 100.0) ? float(d) : 0.0f;
+      }();
+      return peak;
+    }
+
+    // True once a d9mtmetal.so new enough to carry the HDR entry points has
+    // answered the ABI handshake. See d9mt_newlibrary_params::abi_func_count:
+    // wine's unix dispatch has NO bounds check, so this is the only safe way
+    // to ask "does the other half have function N".
+    bool d9mtmetalHas(uint32_t func) {
+      if (s_d9mtmetalFuncCount.load(std::memory_order_relaxed) > func)
+        return true;
+      // The handshake rides on the blit-library build; force it if the
+      // blitter has not been touched yet (the gate runs before the first blit).
+      std::lock_guard<std::mutex> lock(s_blitMutex);
+      ensureBlitFunctionsLocked();
+      return s_d9mtmetalFuncCount.load(std::memory_order_relaxed) > func;
+    }
+
+    // Tag the layer and switch on extendedDynamicRange.
+    //
+    // Display: the panel's own profile, extended-linearized (mtld3d's
+    //   `passthrough` default, and what the approved look was tested with).
+    //   Needs d9mtmetal -- winemetal's setColorSpace is a closed switch over
+    //   four fixed CGColorSpace names with no route to the display's own.
+    // ScRgb:   kCGColorSpaceExtendedLinearSRGB via winemetal. Always available.
+    // Pq:      kCGColorSpaceITUR_2100_PQ via winemetal. Already implemented in
+    //   the pinned v0.80 -- PQ output needs no unixlib work, only the optional
+    //   mastering metadata does.
+    void applyHdrColorSpaceLocked(obj_handle_t layer) {
+      if (s_hdrSpace == HdrSpace::Display
+       && d9mtmetalHas(D9MT_FUNC_LAYER_COLORSPACE)) {
+        d9mt_layer_colorspace_params p = { };
+        p.layer           = uint64_t(layer);
+        p.colorspace_kind = D9MT_COLORSPACE_DISPLAY_EXTENDED_LINEAR;
+        p.wants_edr       = 1u;
+        if (D9MT_UnixCall(D9MT_FUNC_LAYER_COLORSPACE, &p) == 0 && p.ret_ok)
+          return;
+        Logger::warn("d9mt: hdr: display-native colorspace unavailable — "
+                     "falling back to extended-linear sRGB");
+      }
+
+      WMTColorSpace cs = s_hdrSpace == HdrSpace::Pq ? WMTColorSpaceHDR_PQ
+                                                    : WMTColorSpaceHDR_scRGB;
+      if (!CGColorSpace_checkColorSpaceSupported(cs)) {
+        Logger::warn("d9mt: hdr: colorspace unsupported by CoreGraphics — "
+                     "layer left untagged");
+        return;
+      }
+      // NB: HDR_scRGB, not SRGBLinear. Both map to kCGColorSpaceExtendedLinear
+      // SRGB, but only the HDR_ enum sets wantsExtendedDynamicRangeContent
+      // (WMT_COLORSPACE_IS_HDR tests bit 2) — picking the wrong one gives a
+      // correct-looking tag with the headroom permanently pinned at 1.0.
+      if (!MetalLayer_setColorSpace(layer, cs))
+        Logger::warn("d9mt: hdr: setColorSpace failed");
+    }
+
+    // Ask d9mtmetal for the layer's EDR headroom. NEVER calls winemetal's
+    // MetalLayer_getEDRValue: that walks layer.delegate -> NSView -> NSWindow
+    // -> NSScreen on the calling thread, and those are main-thread-only.
+    // refresh=true also queues a main-queue re-read for next time.
+    bool queryLayerEdr(obj_handle_t layer, bool refresh, float* outCur, float* outPotential) {
+      if (!layer || !d9mtmetalHas(D9MT_FUNC_LAYER_EDR))
+        return false;
+
+      d9mt_layer_edr_params p = { };
+      p.layer   = uint64_t(layer);
+      p.refresh = refresh ? 1u : 0u;
+      if (D9MT_UnixCall(D9MT_FUNC_LAYER_EDR, &p) != 0)
+        return false;
+
+      if (outCur)       *outCur = p.ret_max_edr;
+      if (outPotential) *outPotential = p.ret_max_potential;
+      return true;
+    }
+
+  } // anonymous namespace
+
+
+  // Called once per present. Cheap: two relaxed atomic loads plus, every 32nd
+  // present, one unixcall that only reads published statics and queues a
+  // main-queue block. mtld3d uses the same 32-present cadence.
+  void refreshHdrHeadroom(obj_handle_t layer) {
+    if (!s_hdrActive.load(std::memory_order_relaxed))
+      return;
+
+    static uint32_t counter = 0;
+    // seeded already-due so the very first present triggers a walk
+    bool due = (counter++ % 32u) == 0u;
+
+    float cur = 1.0f;
+    if (!queryLayerEdr(layer, due, &cur, nullptr))
+      return;
+
+    float prev = s_hdrPeak.load(std::memory_order_relaxed);
+    s_hdrPeak.store(cur, std::memory_order_relaxed);
+
+    // Log only past 5% drift, or the first time we leave 1.0 — otherwise this
+    // would spam once per brightness tick.
+    if (std::fabs(cur - prev) > 0.05f * std::max(prev, 1.0f)) {
+      Logger::info(str::format("d9mt: hdr: headroom ", prev, "x -> ", cur,
+        "x (L_hdr=", cur * 100.0f, " nits)"));
+    }
+  }
+
+
+  // Gate on maximum_POTENTIAL headroom: it is the static panel ceiling and is
+  // readable before anything is configured. The DYNAMIC value reads 1.0 until
+  // macOS actually promotes the screen, so gating on that would mean HDR never
+  // engages at all. Latched once and never re-evaluated, Reset included.
+  bool hdrEvaluateGate(obj_handle_t layer) {
+    // Do NOT latch without a layer: the latch is permanent, so an early call
+    // with no layer yet would pin HDR off for the whole process.
+    if (!layer)
+      return s_hdrActive.load(std::memory_order_relaxed);
+
+    if (!s_hdrLatched.exchange(true)) {
+      bool want = hdrEnvMode() != HdrEnv::Off;
+      float cur = 1.0f, potential = 1.0f;
+      bool haveEdr = want && queryLayerEdr(layer, true, &cur, &potential);
+      bool active = want && haveEdr && std::isfinite(potential) && potential > 1.0f;
+
+      s_hdrSpace = hdrEnvSpace();
+
+      if (want && !haveEdr) {
+        Logger::warn("d9mt: hdr: requested, but this d9mtmetal has no main-queue "
+                     "EDR entry point (stale unixlib) - running SDR");
+      } else if (want && !active) {
+        Logger::info(str::format("d9mt: hdr: no EDR headroom on this display "
+          "(potential=", potential, "x) - running SDR"));
+      } else if (active) {
+        Logger::info(str::format("d9mt: hdr: active, potential headroom ", potential,
+          "x, colorspace=", s_hdrSpace == HdrSpace::Display ? "display-extended-linear"
+                          : s_hdrSpace == HdrSpace::Pq      ? "pq"
+                                                            : "scrgb"));
+      }
+      s_hdrActive.store(active, std::memory_order_relaxed);
+    }
+    return s_hdrActive.load(std::memory_order_relaxed);
+  }
+
+  void hdrApplyColorSpace(obj_handle_t layer) { applyHdrColorSpaceLocked(layer); }
+
+  bool hdrLayerActive() { return s_hdrActive.load(std::memory_order_relaxed); }
+
+  bool hdrWantsPq() { return s_hdrSpace == HdrSpace::Pq; }
+
+  float hdrPeak() {
+    float over = hdrEnvPeakOverride();
+    return over > 0.0f ? over : s_hdrPeak.load(std::memory_order_relaxed);
+  }
+
+  HdrParams hdrParamsForPeak(float peak) {
+    HdrParams u = { };
+    u.lHdrNits     = peak * 100.0f;
+    u.pHdr         = 1.0f + 32.0f * std::pow(u.lHdrNits / 10000.0f, 1.0f / 2.4f);
+    u.log2PHdr     = std::log2(u.pHdr);
+    u.invPMinusOne = 1.0f / (u.pHdr - 1.0f);
+    return u;
   }
 
 
@@ -610,6 +1108,8 @@ fragment void d9mt_dsclear_fs() {}
     bool warnedGamma  = false;
     bool warnedCursor = false;
     bool warnedMsaa   = false;
+    bool warnedHdrGamma    = false;
+    bool warnedHdrSrgbView = false;
     std::vector<DxvkGammaCp> gammaRamp;
     // Cached 1-sample target for resolving a multisampled present source (a game
     // that requests an MSAA swapchain). Created lazily, reused every frame,
@@ -716,6 +1216,8 @@ namespace dxvk {
       std::lock_guard<std::mutex> lock(state.mutex);
 
       obj_handle_t queue = d9mt::mtlCommandQueue();
+
+      d9mt::refreshHdrHeadroom(state.layer);
 
       if (!state.layer || state.proxy == nullptr || !queue) {
         status = VK_ERROR_OUT_OF_DATE_KHR;
@@ -858,7 +1360,12 @@ namespace dxvk {
 
 
   bool Presenter::supportsColorSpace(VkColorSpaceKHR colorspace) {
-    return colorspace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    if (colorspace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+      return true;
+    // Only advertise the HDR space once the gate has actually latched it on;
+    // otherwise an app querying early would be told yes on an SDR panel.
+    return colorspace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+        && d9mt::hdrLayerActive();
   }
 
 
@@ -972,6 +1479,9 @@ namespace dxvk {
      && !m_dirtySwapchain)
       return VK_SUCCESS;
 
+    // One-shot HDR capability gate; see d9mt::hdrEvaluateGate.
+    const bool hdr = d9mt::hdrEvaluateGate(state.layer);
+
     // resize the layer's drawables; framebuffer_only=false is REQUIRED
     // (the drawable is a blit destination, not a render target)
     WMTLayerProps props = { };
@@ -983,15 +1493,24 @@ namespace dxvk {
     props.opaque = true;
     props.display_sync_enabled = m_preferredSyncInterval != 0u;
     props.framebuffer_only = false;
-    props.pixel_format = WMTPixelFormatBGRA8Unorm;
+    // COUPLED with the proxy format below: presentImage copies proxy ->
+    // drawable through the BLIT encoder, which requires identical formats.
+    // Changing one without the other is a Metal validation abort.
+    props.pixel_format = hdr ? WMTPixelFormatRGBA16Float : WMTPixelFormatBGRA8Unorm;
     MetalLayer_setProps(state.layer, &props);
+
+    // Must follow setProps: the tag applies to the layer we just reformatted.
+    if (hdr)
+      d9mt::hdrApplyColorSpace(state.layer);
 
     if (state.proxy == nullptr
      || state.proxyExtent.width  != extent.width
      || state.proxyExtent.height != extent.height) {
       DxvkImageCreateInfo info;
       info.type        = VK_IMAGE_TYPE_2D;
-      info.format      = VK_FORMAT_B8G8R8A8_UNORM;
+      // COUPLED with props.pixel_format above — same-format blit requirement.
+      info.format      = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT
+                             : VK_FORMAT_B8G8R8A8_UNORM;
       info.flags       = 0u;
       info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
       info.extent      = { extent.width, extent.height, 1u };
@@ -1011,7 +1530,8 @@ namespace dxvk {
                        | VK_ACCESS_TRANSFER_WRITE_BIT;
       info.tiling      = VK_IMAGE_TILING_OPTIMAL;
       info.layout      = VK_IMAGE_LAYOUT_GENERAL;
-      info.colorSpace  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      info.colorSpace  = hdr ? VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+                             : VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
       info.debugName   = "d9mt presenter proxy";
 
       try {
@@ -1102,6 +1622,51 @@ namespace dxvk {
 
     bool useGamma = (m_gammaCpCount != 0 && !bs.gammaRamp.empty());
 
+    // HDR present variant. Keyed off the DESTINATION format so this can only
+    // ever engage on the fp16 proxy the HDR gate created — a stray blit into
+    // anything else keeps HdrMode::None.
+    WMTPixelFormat dstFmtEarly = d9mt::wmtFormatFor(dstView->info().format);
+    d9mt::HdrMode hdrMode = d9mt::HdrMode::None;
+    float hdrPeakValue = 1.0f;
+
+    if (d9mt::hdrLayerActive() && dstFmtEarly == WMTPixelFormatRGBA16Float) {
+      hdrPeakValue = d9mt::hdrPeak();
+      // BT.2446-A is NOT identity at L_hdr == L_sdr (it under-corrects by
+      // ~28% at mid grey), so below/at unity headroom we must run a plain
+      // sRGB decode instead of the curve with a no-op target. macOS reports
+      // 1.0 until it actually promotes the screen, so this is the state every
+      // session starts in — without the short-circuit the first frames are
+      // visibly crushed.
+      hdrMode = (hdrPeakValue > 1.0f) ? d9mt::HdrMode::Bt2446
+                                 : d9mt::HdrMode::Passthrough;
+
+      if (hdrMode == d9mt::HdrMode::Bt2446 && d9mt::hdrWantsPq())
+        hdrMode = d9mt::HdrMode::Bt2446Pq;
+
+      // Gamma and HDR are mutually exclusive, HDR wins (DXMT takes the same
+      // posture). Applying the ramp first would feed a display-referred LUT
+      // into an inverse tone map as if it were scene luminance; applying it
+      // after is worse still, because the LUT's clamp(int3(index),0,255) hard
+      // clips every EDR highlight back to 1.0 and undoes the whole point of
+      // the fp16 layer. Dead code in practice: DXVK only forwards ramps when
+      // !Windowed, and the launcher pins gxWindow=1.
+      if (useGamma && !bs.warnedHdrGamma) {
+        bs.warnedHdrGamma = true;
+        Logger::warn("d9mt: hdr: gamma ramp ignored while HDR present is active");
+      }
+      useGamma = false;
+
+      // One-shot: the fragments assume an sRGB-ENCODED source, because DXVK
+      // hands present the non-sRGB view (GetSampleView(false)). If that ever
+      // changes, Metal would decode too and we would double-decode.
+      if (!bs.warnedHdrSrgbView
+       && srcView->info().format != srcView->image()->info().format) {
+        bs.warnedHdrSrgbView = true;
+        Logger::warn("d9mt: hdr: present source view format differs from the image "
+                     "format — verify it is not an _SRGB view (double decode)");
+      }
+    }
+
     // unimplemented composition features — fail loud, keep presenting
     if (bs.cursorTextureSet && m_cursorRect.extent.width && !bs.warnedCursor) {
       bs.warnedCursor = true;
@@ -1188,7 +1753,8 @@ namespace dxvk {
      && srcRect.extent.height == dstRect.extent.height
      && !srcView->info().packedSwizzle
      && !dstView->info().packedSwizzle
-     && !useGamma) {
+     && !useGamma
+     && hdrMode == d9mt::HdrMode::None) {
       wmtcmd_blit_copy_from_texture_to_texture cp = { };
       cp.type = WMTBlitCommandCopyFromTextureToTexture;
       cp.src = srcHandle;
@@ -1212,7 +1778,7 @@ namespace dxvk {
       return;
     }
 
-    obj_handle_t pso = d9mt::getBlitPso(dstFormat, false, useGamma);
+    obj_handle_t pso = d9mt::getBlitPso(dstFormat, false, useGamma, hdrMode);
     if (!pso)
       return;
 
@@ -1221,8 +1787,15 @@ namespace dxvk {
     pass.render_target_height = dstExtent.height;
     pass.colors[0].texture = dstHandle;
     pass.colors[0].store_action = WMTStoreActionStore;
-    if (fullDst) {
+    if (fullDst && hdrMode == d9mt::HdrMode::None) {
       pass.colors[0].load_action = WMTLoadActionDontCare;
+    } else if (fullDst) {
+      // Undefined fp16 memory reads back as magenta noise, and the fullscreen
+      // triangle only *usually* covers every sample. A tile-GPU fast clear is
+      // near-free and removes the whole failure class (mtld3d shipped this bug
+      // three separate times). SDR keeps DontCare so that path is unchanged.
+      pass.colors[0].load_action = WMTLoadActionClear;
+      pass.colors[0].clear_color = { 0.0, 0.0, 0.0, 1.0 };
     } else {
       // letterbox: clear the uncovered border to opaque black
       pass.colors[0].load_action = WMTLoadActionClear;
@@ -1246,7 +1819,17 @@ namespace dxvk {
     wmtcmd_render_settexture setTex = { };
     wmtcmd_render_setbytes setBytes = { };
     wmtcmd_render_setbytes setGammaBytes = { };
+    wmtcmd_render_setbytes setHdrBytes = { };
     wmtcmd_render_draw draw = { };
+
+    // buffer(0) is BlitParams, buffer(1) is the gamma ramp, so HDR takes
+    // buffer(2). Gamma and HDR are mutually exclusive, so the chain never
+    // carries both.
+    const bool needsHdrBytes = hdrMode == d9mt::HdrMode::Bt2446
+                            || hdrMode == d9mt::HdrMode::Bt2446Pq;
+    d9mt::HdrParams hdrParams = { };
+    if (needsHdrBytes)
+      hdrParams = d9mt::hdrParamsForPeak(hdrPeakValue);
 
     setPso.type = WMTRenderCommandSetPSO;
     setPso.next.set(&setVp);
@@ -1278,6 +1861,8 @@ namespace dxvk {
     setTex.index = 0;
 
     setBytes.type = WMTRenderCommandSetFragmentBytes;
+    // The passthrough variant takes no uniform block (it is a bare sRGB
+    // decode), so only the curve variants get one -- needsHdrBytes above.
     if (useGamma) {
       setBytes.next.set(&setGammaBytes);
       setGammaBytes.type = WMTRenderCommandSetFragmentBytes;
@@ -1285,6 +1870,13 @@ namespace dxvk {
       setGammaBytes.bytes.set(bs.gammaRamp.data());
       setGammaBytes.length = bs.gammaRamp.size() * sizeof(DxvkGammaCp);
       setGammaBytes.index = 1;
+    } else if (needsHdrBytes) {
+      setBytes.next.set(&setHdrBytes);
+      setHdrBytes.type = WMTRenderCommandSetFragmentBytes;
+      setHdrBytes.next.set(&draw);
+      setHdrBytes.bytes.set(&hdrParams);
+      setHdrBytes.length = sizeof(hdrParams);
+      setHdrBytes.index = 2;
     } else {
       setBytes.next.set(&draw);
     }

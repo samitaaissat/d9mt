@@ -20,7 +20,8 @@ clang -ObjC -dynamiclib -arch x86_64 -O2 \
   -I "$SRC" \
   -install_name @rpath/d9mtmetal.so \
   -lsqlite3 \
-  -framework Metal -framework Foundation
+  -framework Metal -framework Foundation \
+  -framework QuartzCore -framework AppKit
 
 echo "[d9mtmetal] ntdll import libs from CrossOver's ntdll exports"
 # 32-bit: stdcall-decorated import names, -k strips the @N from the

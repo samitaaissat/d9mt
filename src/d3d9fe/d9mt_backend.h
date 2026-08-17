@@ -199,7 +199,45 @@ namespace dxvk::d9mt {
     float uvScale[2];
   };
 
-  obj_handle_t getBlitPso(WMTPixelFormat dstFormat, bool pointFilter = false, bool useGamma = false);
+  // HDR present variants. Only DxvkSwapchainBlitter::present ever passes
+  // anything but None; every other blit consumer keeps the default and its
+  // PSO key stays bit-identical to the pre-HDR one.
+  //   Passthrough  sRGB EOTF only -- used while live EDR headroom is <= 1.0.
+  //                BT.2446-A is NOT identity there (-28% at mid grey), so
+  //                this is a separate pipeline, not the curve with a no-op
+  //                target.
+  //   Bt2446       BT.2446-A inverse tone map in ICtCp, extended-linear out.
+  //   Bt2446Pq     the same curve, ST.2084/BT.2020 encoded. Not mtld3d parity.
+  enum class HdrMode : uint32_t {
+    None        = 0,
+    Passthrough = 1,
+    Bt2446      = 2,
+    Bt2446Pq    = 3,
+  };
+
+  // Uniform block for the HDR fragments, bound at fragment buffer(2).
+  // Byte-identical to mtld3d's HdrUniforms.
+  struct HdrParams {
+    float lHdrNits;      // live EDR headroom * 100
+    float pHdr;          // 1 + 32*pow(lHdrNits/10000, 1/2.4)   [unread by GPU]
+    float log2PHdr;      // log2(pHdr)
+    float invPMinusOne;  // 1/(pHdr - 1)
+  };
+
+  obj_handle_t getBlitPso(WMTPixelFormat dstFormat, bool pointFilter = false,
+                          bool useGamma = false, HdrMode hdrMode = HdrMode::None);
+
+  // ---- HDR present state (d9mt_presenter.cpp) -----------------------------
+  // hdrEnvMode(): the resolved D9MT_HDR setting (0 off / 1 on / 2 auto).
+  // hdrLayerActive(): the one-shot capability latch.
+  // hdrPeak(): last published live EDR headroom multiplier (1.0 = none).
+  bool     hdrLayerActive();
+  float    hdrPeak();
+  HdrParams hdrParamsForPeak(float peak);
+  void     refreshHdrHeadroom(obj_handle_t layer);
+  bool     hdrWantsPq();
+  bool     hdrEvaluateGate(obj_handle_t layer);
+  void     hdrApplyColorSpace(obj_handle_t layer);
 
   // Depth(+stencil) SAMPLE_ZERO resolve PSO (d9mt_presenter.cpp): fullscreen
   // triangle exporting [[depth(any)]] (+ [[stencil]]) read from sample 0 of

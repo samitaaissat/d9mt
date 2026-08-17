@@ -11,6 +11,13 @@
 // uint64_t, so the 32-bit and 64-bit param layouts are IDENTICAL and the
 // wow64 call table can reuse the same entry points.
 
+/* The HDR entry points (D9MT_FUNC_LAYER_EDR / _COLORSPACE / _EDR_METADATA) and
+ * their main-queue publish design are derived from mtld3d v0.6.0
+ * (unix/unix/src/metal/{macdrv,command}.rs), Copyright (c) 2026 Alexander
+ * Theissen, zlib licence. ALTERED SOURCE: re-expressed as a wine-unixlib ABI
+ * in C/ObjC rather than mtld3d's own unix half, with an added ABI-count
+ * handshake. See THIRD_PARTY_NOTICES.md. */
+
 #ifndef D9MTMETAL_H
 #define D9MTMETAL_H
 
@@ -47,6 +54,40 @@ enum d9mt_unix_func {
    * native-side. end_immediately=1 encodes a load/store-action-only pass
    * (deferred clears) and returns no encoder. pass_ptr=0 = end-only. */
   D9MT_FUNC_PASS_TRANSITION = 5,
+  /* CAMetalLayer EDR headroom, read on the MAIN QUEUE.
+   *
+   * winemetal HAS MetalLayer_getEDRValue, but its implementation walks
+   * layer.delegate -> NSView -> NSWindow -> NSScreen on the CALLING thread.
+   * NSView.window and NSWindow.screen are main-thread-only, and a zone
+   * transition is exactly when the main thread rebuilds them. mtld3d shipped
+   * that bug and crashed in AppKit ~3s into a raid (their commit 119c0db).
+   * Here it would be worse than a crash: wine absorbs faults on non-wine
+   * threads silently, so the present thread would just die and the render
+   * would freeze with the process still alive.
+   *
+   * So: this call NEVER touches AppKit on the caller's thread. It returns the
+   * last values published by a main-queue block and, when refresh=1, queues
+   * another one (fire-and-forget, at most one outstanding). Values are seeded
+   * to 1.0, which the present shader treats as "no headroom" and handles with
+   * its passthrough variant. */
+  D9MT_FUNC_LAYER_EDR = 6,
+  /* Tag a CAMetalLayer with the DISPLAY's own colorspace, extended-linearized
+   * (CGColorSpaceCreateExtendedLinearized of the screen's profile) and set
+   * wantsExtendedDynamicRangeContent.
+   *
+   * winemetal's MetalLayer_setColorSpace only accepts four hard-coded
+   * CGColorSpace names (GetColorSpaceName is a closed switch); there is no
+   * route to the display's own profile. That profile is mtld3d's default
+   * (`color.space = passthrough`) and therefore what the approved look was
+   * tested against, so we need it for parity. Falls back reporting failure,
+   * and the caller then uses winemetal's extended-linear sRGB.
+   * Runs on the main queue (CAMetalLayer property writes + NSScreen access). */
+  D9MT_FUNC_LAYER_COLORSPACE = 7,
+  /* CAEDRMetadata on the layer (HDR10 mastering volume). Only meaningful for
+   * the PQ output mode: it tells the compositor our mastering intent so its
+   * PQ->display mapping is informed rather than assumed. Absent from winemetal
+   * entirely. Optional - PQ works without it. */
+  D9MT_FUNC_LAYER_EDR_METADATA = 8,
   D9MT_FUNC_COUNT,
 };
 
@@ -65,6 +106,42 @@ struct d9mt_capture_params {
   uint64_t path_len;  /* in */
   uint32_t action;    /* in: 1=begin, 0=end                                */
   uint32_t ret_ok;    /* out: 1 if the action succeeded                    */
+};
+
+/* colorspace_kind for d9mt_layer_colorspace_params */
+enum d9mt_layer_colorspace {
+  /* CGColorSpaceCreateExtendedLinearized(screen.colorSpace.CGColorSpace) —
+   * the display's own primaries, linearized. mtld3d's `passthrough`. */
+  D9MT_COLORSPACE_DISPLAY_EXTENDED_LINEAR = 0,
+};
+
+struct d9mt_layer_edr_params {
+  uint64_t layer;             /* in:  CAMetalLayer handle                        */
+  uint32_t refresh;           /* in:  1 = also queue a main-queue re-read        */
+  uint32_t ret_published;     /* out: 1 if a main-queue walk has ever completed  */
+  float    ret_max_edr;       /* out: live headroom multiplier, or 1.0           */
+  float    ret_max_potential; /* out: static panel ceiling, or 1.0               */
+};
+
+struct d9mt_layer_colorspace_params {
+  uint64_t layer;           /* in:  CAMetalLayer handle                    */
+  uint32_t colorspace_kind; /* in:  enum d9mt_layer_colorspace             */
+  uint32_t wants_edr;       /* in:  wantsExtendedDynamicRangeContent value */
+  uint32_t ret_ok;          /* out: 1 if the tag was applied               */
+  uint32_t padding;
+};
+
+/* Values are SMPTE ST.2086 style: primaries/white point in 0.00002 units,
+ * luminance in 0.0001 cd/m2 for min and 1 cd/m2 for max, matching
+ * CAEDRMetadata.hdr10ContentProperties semantics after conversion. */
+struct d9mt_layer_edr_metadata_params {
+  uint64_t layer;                     /* in: CAMetalLayer handle              */
+  float    min_luminance_nits;        /* in: mastering display min            */
+  float    max_luminance_nits;        /* in: mastering display max            */
+  float    max_content_light_level;   /* in: MaxCLL,  0 = omit                */
+  float    max_frame_average_light;   /* in: MaxFALL, 0 = omit                */
+  uint32_t clear;                     /* in: 1 = drop the metadata instead    */
+  uint32_t ret_ok;                    /* out: 1 if applied                    */
 };
 
 struct d9mt_hud_color_params {
@@ -114,7 +191,21 @@ struct d9mt_newlibrary_params {
   uint64_t source_ptr; /* in:  const char* UTF-8 MSL  */
   uint64_t source_len; /* in */
   uint32_t fast_math;  /* in:  bool */
-  uint32_t padding;
+  /* out: ABI HANDSHAKE. The .so writes D9MT_FUNC_COUNT here, unconditionally
+   * and before any early return. This was `padding` and PE callers already
+   * zero-initialise the struct, so an OLDER .so leaves it 0.
+   *
+   * Why it has to be smuggled through an entry point that already exists:
+   * __wine_unix_call indexes the table with NO bounds check, so probing a new
+   * function code against an old .so does not fail — it jumps through whatever
+   * bytes follow the table. "Call it and check the status" IS the crash. Every
+   * call code added after 5 must therefore be gated on
+   *   abi_func_count > <that code>
+   * and a mismatched pair degrades to the old feature set instead of
+   * executing garbage. (The payload ships d3d9.dll + d9mtmetal.{dll,so}
+   * atomically under one sha256, so skew should not happen; this is the belt
+   * to that braces.) */
+  uint32_t abi_func_count;
   uint64_t ret_library; /* out: retained MTLLibrary or 0 */
   uint64_t ret_error;   /* out: retained NSError or 0 (caller releases) */
 };

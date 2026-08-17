@@ -3,16 +3,27 @@
  * wine loader resolves when the matching builtin PE loads.
  * Param structs are identical for 32/64-bit callers (all-u64 pointers),
  * so both tables point at the same implementations.
+ *
+ * The HDR section near the bottom (d9mt_layer_edr / _colorspace /
+ * _edr_metadata) is derived from mtld3d v0.6.0
+ * (unix/unix/src/metal/{macdrv,command}.rs), Copyright (c) 2026 Alexander
+ * Theissen, zlib licence. ALTERED SOURCE: re-expressed in ObjC against this
+ * unixlib ABI; the retain-across-the-hop and single-outstanding-block handling
+ * are ours. See THIRD_PARTY_NOTICES.md.
  */
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
+#import <AppKit/AppKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
+#include <math.h>
 #include <pthread.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -30,6 +41,10 @@ typedef int NTSTATUS; /* wine unixlib_entry_t contract */
 
 static NTSTATUS d9mt_new_library_from_source(void *args) {
   struct d9mt_newlibrary_params *p = args;
+  /* ABI handshake — see the comment on the field. MUST be written before any
+   * early return, and this must stay the first statement so it survives
+   * refactors of the body below. */
+  p->abi_func_count = (uint32_t)D9MT_FUNC_COUNT;
   p->ret_library = 0;
   p->ret_error = 0;
 
@@ -853,6 +868,173 @@ static NTSTATUS d9mt_pass_transition(void *args) {
   return STATUS_SUCCESS;
 }
 
+/* ==========================================================================
+ * HDR: layer EDR headroom, colorspace tagging, mastering metadata.
+ *
+ * Everything here that touches AppKit (NSView.window, NSWindow.screen,
+ * NSScreen.*) or CALayer properties runs on the MAIN QUEUE. See the header
+ * comment on D9MT_FUNC_LAYER_EDR for why that is not optional.
+ * ========================================================================== */
+
+/* Run a block on the main queue. Mirrors winemetal's own execute_on_main:
+ * direct call when already on main, dispatch_sync otherwise. Used only for
+ * the two configure-time calls (colorspace, metadata), never per frame. */
+static void d9mt_on_main_sync(dispatch_block_t block) {
+  if ([NSThread isMainThread])
+    block();
+  else
+    dispatch_sync(dispatch_get_main_queue(), block);
+}
+
+/* main thread only */
+static NSScreen *d9mt_screen_for_layer(CALayer *layer) {
+  id delegate = layer ? layer.delegate : nil;
+  if ([delegate isKindOfClass:[NSView class]]) {
+    NSWindow *window = ((NSView *)delegate).window;
+    if (window && window.screen)
+      return window.screen;
+  }
+  /* wine's macdrv always sets an NSView delegate, but a layer whose window is
+   * mid-teardown (or off every screen) legitimately has none. The main screen
+   * is the right answer then, and it is also what we want before the game's
+   * window is first ordered in. */
+  return [NSScreen mainScreen];
+}
+
+/* Published by the main-queue block, read by the present thread. Process-wide:
+ * one game window, and a second layer would only ever want the same display's
+ * headroom anyway. */
+static _Atomic float    g_edr_max = 1.0f;
+static _Atomic float    g_edr_max_potential = 1.0f;
+static _Atomic uint32_t g_edr_published = 0;
+static _Atomic uint32_t g_edr_inflight = 0;
+
+static NTSTATUS d9mt_layer_edr(void *args) {
+  struct d9mt_layer_edr_params *p = args;
+
+  /* Answer from the published snapshot FIRST — this call must never block and
+   * must never touch AppKit on the caller's thread. */
+  p->ret_max_edr       = atomic_load_explicit(&g_edr_max, memory_order_relaxed);
+  p->ret_max_potential = atomic_load_explicit(&g_edr_max_potential, memory_order_relaxed);
+  p->ret_published     = atomic_load_explicit(&g_edr_published, memory_order_relaxed);
+
+  if (!p->refresh || !p->layer)
+    return STATUS_SUCCESS;
+
+  /* At most one outstanding walk. If the main thread is busy we simply keep
+   * serving the last snapshot rather than queueing a backlog. */
+  uint32_t expected = 0;
+  if (!atomic_compare_exchange_strong_explicit(&g_edr_inflight, &expected, 1u,
+                                               memory_order_acq_rel,
+                                               memory_order_relaxed))
+    return STATUS_SUCCESS;
+
+  /* Retain across the hop: the layer could be torn down between the async
+   * dispatch and the block running. */
+  CAMetalLayer *layer = (CAMetalLayer *)(uintptr_t)p->layer;
+  [layer retain];
+
+  dispatch_async(dispatch_get_main_queue(), ^{
+    @autoreleasepool {
+      NSScreen *screen = d9mt_screen_for_layer(layer);
+      if (screen) {
+        float cur = (float)screen.maximumExtendedDynamicRangeColorComponentValue;
+        float pot = (float)screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+        /* AppKit reports 0 for "unknown" on some paths; 1.0 is the identity
+         * value the present shader treats as "no headroom". */
+        if (!(cur >= 1.0f) || !isfinite(cur))
+          cur = 1.0f;
+        if (!(pot >= 1.0f) || !isfinite(pot))
+          pot = 1.0f;
+        atomic_store_explicit(&g_edr_max, cur, memory_order_relaxed);
+        atomic_store_explicit(&g_edr_max_potential, pot, memory_order_relaxed);
+        atomic_store_explicit(&g_edr_published, 1u, memory_order_relaxed);
+      }
+    }
+    [layer release];
+    atomic_store_explicit(&g_edr_inflight, 0u, memory_order_release);
+  });
+
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS d9mt_layer_colorspace(void *args) {
+  struct d9mt_layer_colorspace_params *p = args;
+  p->ret_ok = 0;
+
+  CAMetalLayer *layer = (CAMetalLayer *)(uintptr_t)p->layer;
+  if (!layer)
+    return STATUS_SUCCESS;
+
+  const uint32_t kind = p->colorspace_kind;
+  const BOOL wantsEdr = p->wants_edr ? YES : NO;
+  __block uint32_t ok = 0;
+
+  d9mt_on_main_sync(^{
+    @autoreleasepool {
+      if (kind != D9MT_COLORSPACE_DISPLAY_EXTENDED_LINEAR)
+        return;
+
+      NSScreen *screen = d9mt_screen_for_layer(layer);
+      CGColorSpaceRef base = screen ? screen.colorSpace.CGColorSpace : NULL;
+      if (!base)
+        return;
+
+      /* The display's own primaries, made linear. This is what mtld3d tags by
+       * default (`color.space = passthrough`) and therefore what the approved
+       * look was tested against: macOS does an identity round-trip of the
+       * primaries instead of converting to them, so nothing is gamut-mapped. */
+      CGColorSpaceRef linear = CGColorSpaceCreateExtendedLinearized(base);
+      if (!linear)
+        return;
+
+      layer.colorspace = linear;
+      layer.wantsExtendedDynamicRangeContent = wantsEdr;
+      CGColorSpaceRelease(linear);
+      ok = 1;
+    }
+  });
+
+  p->ret_ok = ok;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS d9mt_layer_edr_metadata(void *args) {
+  struct d9mt_layer_edr_metadata_params *p = args;
+  p->ret_ok = 0;
+
+  CAMetalLayer *layer = (CAMetalLayer *)(uintptr_t)p->layer;
+  if (!layer)
+    return STATUS_SUCCESS;
+
+  const uint32_t clear = p->clear;
+  const float minNits = p->min_luminance_nits;
+  const float maxNits = p->max_luminance_nits;
+  __block uint32_t ok = 0;
+
+  d9mt_on_main_sync(^{
+    @autoreleasepool {
+      if (clear) {
+        layer.EDRMetadata = nil;
+        ok = 1;
+        return;
+      }
+      /* opticalOutputScale = 1.0: our PQ values are already absolute nits, so
+       * the compositor should not rescale them. */
+      CAEDRMetadata *md = [CAEDRMetadata HDR10MetadataWithMinLuminance:minNits
+                                                          maxLuminance:maxNits
+                                                    opticalOutputScale:1.0f];
+      if (!md)
+        return;
+      layer.EDRMetadata = md;
+      ok = 1;
+    }
+  });
+
+  p->ret_ok = ok;
+  return STATUS_SUCCESS;
+}
+
 typedef NTSTATUS (*unixlib_entry_t)(void *args);
 
 __attribute__((visibility("default")))
@@ -863,6 +1045,9 @@ const unixlib_entry_t __wine_unix_call_funcs[D9MT_FUNC_COUNT] = {
     d9mt_hud_set_color,
     d9mt_capture,
     d9mt_pass_transition,
+    d9mt_layer_edr,
+    d9mt_layer_colorspace,
+    d9mt_layer_edr_metadata,
 };
 
 /* identical param layouts for 32-bit callers (see header ABI rule) */
@@ -874,4 +1059,7 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[D9MT_FUNC_COUNT] = {
     d9mt_hud_set_color,
     d9mt_capture,
     d9mt_pass_transition,
+    d9mt_layer_edr,
+    d9mt_layer_colorspace,
+    d9mt_layer_edr_metadata,
 };

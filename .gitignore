@@ -6,3 +6,4 @@ prebuilt/
 
 # Tracy profiler client — optional dev tooling, fetched on demand for TRACY=1 builds
 vendor/tracy/
+prebuilt/

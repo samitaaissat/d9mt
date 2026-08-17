@@ -770,230 +770,6 @@ struct d9mt_wmt_render_pass_info {
   uint64_t visibility_buffer;
 };
 
-/* ==========================================================================
- * Render-pass descriptor cache.
- *
- * A pass restart used to allocate a fresh autoreleased MTLRenderPassDescriptor
- * and write ~33 properties into it, 512 times a frame in the shadow /
- * render-target round-trip workload. Those descriptors are almost all
- * duplicates: the round-trip alternates between exactly two pass shapes (the
- * small shadow target and the main target), so the same handful of descriptors
- * is rebuilt over and over.
- *
- * This keeps a few RETAINED descriptors keyed on the full pass-info struct. A
- * hit reuses the descriptor with ZERO ObjC messages; a miss rebuilds one slot
- * from scratch. Metal deep-copies the descriptor at
- * renderCommandEncoderWithDescriptor:, so reuse is safe and a cached
- * descriptor is never aliased by a live encoder.
- *
- * Why the whole struct is a sound key: it is the complete input the descriptor
- * is derived from, so equal bytes mean an identical descriptor. The PE side
- * zero-initialises it (`WMTRenderPassInfo pass = { }`), so padding does not
- * produce spurious misses -- and a spurious MISS is only slower, never wrong.
- *
- * Texture identity: attachments are raw pointers, and MTLRenderPassDescriptor
- * retains them. So a cached slot keeps its textures alive, which means a
- * matching pointer cannot be a DIFFERENT object that happens to reuse the
- * address. The cost is that up to CACHE_N pass shapes' worth of attachments
- * are released later than they otherwise would be -- bounded, transient (the
- * slot is rebuilt as soon as a different shape appears), and DXVK's own
- * command-list tracking already holds these alive for longer than that.
- *
- * Locking: today only the CS thread reaches this, but a process-global cache
- * would turn that into an unwritten invariant whose violation is memory
- * corruption. The mutex is ~20ns uncontended against the ~600ns of messages it
- * saves, so it is not worth the risk to elide.
- *
- * SIZING, and why it decides whether this helps at all: the workload cycles
- * ROUND-ROBIN through a pool of shadow targets (test/bench.c uses 8, plus the
- * main pass = 9 shapes). Round-robin over N shapes through an LRU of K < N
- * slots is the textbook 0%-hit-rate case -- the first cut of this cache had
- * K=4 and therefore never hit, leaving only the allocation saving. The pool
- * has to be comfortably bigger than any plausible shadow-target pool.
- *
- * LOOKUP COST, and why the key is hashed: at this size a linear memcmp scan
- * would compare up to 16 x ~600 bytes per transition, costing more than the
- * ~33 objc_msgSends it is trying to avoid. So each entry carries a 64-bit
- * FNV-1a digest; the scan compares digests and only the single candidate is
- * memcmp'd. A digest collision costs one wasted memcmp and is then resolved
- * correctly by that memcmp -- it can never yield a wrong descriptor.
- * ========================================================================== */
-#define D9MT_PASS_CACHE_N 16
-
-static pthread_mutex_t g_pass_cache_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct {
-  MTLRenderPassDescriptor *desc;                 /* retained, or nil */
-  struct d9mt_wmt_render_pass_info key;
-  uint64_t digest;
-  uint64_t stamp;                                /* for LRU eviction */
-} g_pass_cache[D9MT_PASS_CACHE_N];
-static uint64_t g_pass_cache_clock;
-
-/* Hit-rate instrumentation, gated on D9MT_PASS_CACHE_STATS=1.
- *
- * The wall-clock A/B for this change is worth a few percent, which is inside
- * the noise of a busy host. The hit rate is not: it is a property of the
- * workload, load-independent, and it is what decides whether the change does
- * anything at all (a round-robin pool larger than the cache hits 0% -- see the
- * sizing note above). So measure it directly rather than inferring it.
- *
- * Written to $TMPDIR/d9mt-passcache.txt because wine swallows stderr from the
- * unix side. Refreshed every 4096 transitions, so ~8 frames of the rt bench. */
-static uint64_t g_pass_cache_hits, g_pass_cache_misses;
-
-static void d9mt_pass_cache_stats(void) {
-  static int enabled = -1;
-  if (enabled < 0) {
-    const char *v = getenv("D9MT_PASS_CACHE_STATS");
-    enabled = (v && v[0] == '1') ? 1 : 0;
-  }
-  if (!enabled)
-    return;
-
-  uint64_t total = g_pass_cache_hits + g_pass_cache_misses;
-  if (total == 0 || (total & 4095u) != 0u)
-    return;
-
-  const char *tmp = getenv("TMPDIR");
-  char path[1024];
-  snprintf(path, sizeof(path), "%sd9mt-passcache.txt", tmp ? tmp : "/tmp/");
-  FILE *f = fopen(path, "w");
-  if (!f)
-    return;
-  fprintf(f, "transitions=%llu hits=%llu misses=%llu hit_rate=%.4f slots=%d\n",
-          (unsigned long long)total, (unsigned long long)g_pass_cache_hits,
-          (unsigned long long)g_pass_cache_misses,
-          (double)g_pass_cache_hits / (double)total, D9MT_PASS_CACHE_N);
-  fclose(f);
-}
-
-static uint64_t d9mt_fnv1a(const void *data, size_t len) {
-  const unsigned char *p = data;
-  uint64_t h = 1469598103934665603ull;
-  for (size_t i = 0; i < len; i++) {
-    h ^= p[i];
-    h *= 1099511628211ull;
-  }
-  return h;
-}
-
-/* Writes every field, so the descriptor need not be freshly allocated. */
-static void d9mt_pass_desc_fill(MTLRenderPassDescriptor *desc,
-                                const struct d9mt_wmt_render_pass_info *info) {
-  for (unsigned i = 0; i < 8; i++) {
-    const struct d9mt_wmt_color_att *src = &info->colors[i];
-    MTLRenderPassColorAttachmentDescriptor *att = desc.colorAttachments[i];
-    if (!src->texture) {
-      /* Reused descriptors must be cleared explicitly; a fresh one starts nil.
-       * Setting the texture to nil is what makes Metal ignore the slot. */
-      if (att.texture)
-        att.texture = nil;
-      if (att.resolveTexture)
-        att.resolveTexture = nil;
-      continue;
-    }
-    att.texture = (id<MTLTexture>)(uintptr_t)src->texture;
-    att.level = src->level;
-    att.slice = src->slice;
-    att.depthPlane = src->depth_plane;
-    att.loadAction = (MTLLoadAction)src->load_action;
-    att.storeAction = (MTLStoreAction)src->store_action;
-    att.clearColor = MTLClearColorMake(src->clear_color.r, src->clear_color.g,
-                                       src->clear_color.b, src->clear_color.a);
-    if (src->resolve_texture) {
-      att.resolveTexture = (id<MTLTexture>)(uintptr_t)src->resolve_texture;
-      att.resolveLevel = src->resolve_level;
-      att.resolveSlice = src->resolve_slice;
-      att.resolveDepthPlane = src->resolve_depth_plane;
-    } else if (att.resolveTexture) {
-      att.resolveTexture = nil;
-    }
-  }
-
-  MTLRenderPassDepthAttachmentDescriptor *d = desc.depthAttachment;
-  if (info->depth.texture) {
-    d.texture = (id<MTLTexture>)(uintptr_t)info->depth.texture;
-    d.level = info->depth.level;
-    d.slice = info->depth.slice;
-    d.depthPlane = info->depth.depth_plane;
-    d.loadAction = (MTLLoadAction)info->depth.load_action;
-    d.storeAction = (MTLStoreAction)info->depth.store_action;
-    d.clearDepth = info->depth.clear_depth;
-  } else if (d.texture) {
-    d.texture = nil;
-  }
-
-  MTLRenderPassStencilAttachmentDescriptor *st = desc.stencilAttachment;
-  if (info->stencil.texture) {
-    st.texture = (id<MTLTexture>)(uintptr_t)info->stencil.texture;
-    st.level = info->stencil.level;
-    st.slice = info->stencil.slice;
-    st.depthPlane = info->stencil.depth_plane;
-    st.loadAction = (MTLLoadAction)info->stencil.load_action;
-    st.storeAction = (MTLStoreAction)info->stencil.store_action;
-    st.clearStencil = info->stencil.clear_stencil;
-  } else if (st.texture) {
-    st.texture = nil;
-  }
-
-  /* Unconditional, unlike the original: on a reused descriptor "leave it
-   * alone when the input is 0" would inherit the previous pass's size. */
-  desc.renderTargetWidth  = info->render_target_width;
-  desc.renderTargetHeight = info->render_target_height;
-  desc.renderTargetArrayLength = info->render_target_array_length;
-  if (info->default_raster_sample_count)
-    desc.defaultRasterSampleCount = info->default_raster_sample_count;
-  else
-    desc.defaultRasterSampleCount = 1;
-  desc.visibilityResultBuffer = info->visibility_buffer
-      ? (id<MTLBuffer>)(uintptr_t)info->visibility_buffer : nil;
-}
-
-/* Returns a descriptor matching `info`. Caller must hold no lock. */
-static MTLRenderPassDescriptor *
-d9mt_pass_desc_for(const struct d9mt_wmt_render_pass_info *info) {
-  MTLRenderPassDescriptor *out = nil;
-  const uint64_t digest = d9mt_fnv1a(info, sizeof(*info));
-
-  pthread_mutex_lock(&g_pass_cache_lock);
-
-  int victim = 0;
-  uint64_t oldest = ~0ull;
-  for (int i = 0; i < D9MT_PASS_CACHE_N; i++) {
-    if (!g_pass_cache[i].desc) { victim = i; oldest = 0; continue; }
-    if (g_pass_cache[i].digest == digest
-     && memcmp(&g_pass_cache[i].key, info, sizeof(*info)) == 0) {
-      g_pass_cache[i].stamp = ++g_pass_cache_clock;
-      out = g_pass_cache[i].desc;      /* HIT: zero ObjC messages */
-      g_pass_cache_hits++;
-      d9mt_pass_cache_stats();
-      pthread_mutex_unlock(&g_pass_cache_lock);
-      return out;
-    }
-    if (g_pass_cache[i].stamp < oldest) { oldest = g_pass_cache[i].stamp; victim = i; }
-  }
-
-  if (!g_pass_cache[victim].desc) {
-    /* +1 and never released for the process lifetime: at most
-     * D9MT_PASS_CACHE_N descriptors exist. */
-    g_pass_cache[victim].desc = [[MTLRenderPassDescriptor alloc] init];
-    if (!g_pass_cache[victim].desc) {
-      pthread_mutex_unlock(&g_pass_cache_lock);
-      return [MTLRenderPassDescriptor renderPassDescriptor]; /* degrade, never fail */
-    }
-  }
-  d9mt_pass_desc_fill(g_pass_cache[victim].desc, info);
-  g_pass_cache[victim].key = *info;
-  g_pass_cache[victim].digest = digest;
-  g_pass_cache[victim].stamp = ++g_pass_cache_clock;
-  out = g_pass_cache[victim].desc;
-  g_pass_cache_misses++;
-  d9mt_pass_cache_stats();
-
-  pthread_mutex_unlock(&g_pass_cache_lock);
-  return out;
-}
-
 static NTSTATUS d9mt_pass_transition(void *args) {
   struct d9mt_pass_transition_params *p = args;
   p->ret_encoder = 0;
@@ -1018,13 +794,61 @@ static NTSTATUS d9mt_pass_transition(void *args) {
     if (!cmdbuf)
       return STATUS_SUCCESS;
 
-    /* Content-addressed descriptor cache: see d9mt_pass_desc_for. A hit costs
-     * one memcmp instead of an alloc plus ~33 objc_msgSends, which in the
-     * shadow round-trip workload is the common case (the pass shape
-     * alternates between two forms). */
-    MTLRenderPassDescriptor *desc = d9mt_pass_desc_for(info);
-    if (!desc)
-      return STATUS_SUCCESS;
+    MTLRenderPassDescriptor *desc = [MTLRenderPassDescriptor renderPassDescriptor];
+
+    for (unsigned i = 0; i < 8; i++) {
+      const struct d9mt_wmt_color_att *src = &info->colors[i];
+      if (!src->texture)
+        continue;
+      MTLRenderPassColorAttachmentDescriptor *att = desc.colorAttachments[i];
+      att.texture = (id<MTLTexture>)(uintptr_t)src->texture;
+      att.level = src->level;
+      att.slice = src->slice;
+      att.depthPlane = src->depth_plane;
+      att.loadAction = (MTLLoadAction)src->load_action;
+      att.storeAction = (MTLStoreAction)src->store_action;
+      att.clearColor = MTLClearColorMake(src->clear_color.r, src->clear_color.g,
+                                         src->clear_color.b, src->clear_color.a);
+      if (src->resolve_texture) {
+        att.resolveTexture = (id<MTLTexture>)(uintptr_t)src->resolve_texture;
+        att.resolveLevel = src->resolve_level;
+        att.resolveSlice = src->resolve_slice;
+        att.resolveDepthPlane = src->resolve_depth_plane;
+      }
+    }
+
+    if (info->depth.texture) {
+      MTLRenderPassDepthAttachmentDescriptor *att = desc.depthAttachment;
+      att.texture = (id<MTLTexture>)(uintptr_t)info->depth.texture;
+      att.level = info->depth.level;
+      att.slice = info->depth.slice;
+      att.depthPlane = info->depth.depth_plane;
+      att.loadAction = (MTLLoadAction)info->depth.load_action;
+      att.storeAction = (MTLStoreAction)info->depth.store_action;
+      att.clearDepth = info->depth.clear_depth;
+    }
+
+    if (info->stencil.texture) {
+      MTLRenderPassStencilAttachmentDescriptor *att = desc.stencilAttachment;
+      att.texture = (id<MTLTexture>)(uintptr_t)info->stencil.texture;
+      att.level = info->stencil.level;
+      att.slice = info->stencil.slice;
+      att.depthPlane = info->stencil.depth_plane;
+      att.loadAction = (MTLLoadAction)info->stencil.load_action;
+      att.storeAction = (MTLStoreAction)info->stencil.store_action;
+      att.clearStencil = info->stencil.clear_stencil;
+    }
+
+    if (info->render_target_width) {
+      desc.renderTargetWidth = info->render_target_width;
+      desc.renderTargetHeight = info->render_target_height;
+    }
+    if (info->render_target_array_length)
+      desc.renderTargetArrayLength = info->render_target_array_length;
+    if (info->default_raster_sample_count)
+      desc.defaultRasterSampleCount = info->default_raster_sample_count;
+    if (info->visibility_buffer)
+      desc.visibilityResultBuffer = (id<MTLBuffer>)(uintptr_t)info->visibility_buffer;
 
     id<MTLRenderCommandEncoder> enc = [cmdbuf renderCommandEncoderWithDescriptor:desc];
     if (!enc)

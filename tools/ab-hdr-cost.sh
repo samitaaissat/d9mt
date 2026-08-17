@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
 # ABAB interleave of HDR-off vs HDR-on with the SAME binaries (env var only),
-# so any delta is the HDR present path PLUS the cost of the compositor actually
-# running the layer in EDR mode. The second part is the unknown: the tone map
-# itself measured ~+1.5% at a forced peak, but a run where macOS genuinely
-# promoted the screen to EDR mid-way (headroom 1.2x -> 2.53x) showed +53%. Those
-# two disagree by 35x and neither is trustworthy - both were short runs on a host
-# at load 20-75.
+# so any delta is the HDR present path plus whatever the compositor costs when
+# it actually runs the layer in EDR mode.
 #
-# RUN THIS ON AN IDLE MACHINE. Check `sysctl -n vm.loadavg` is under ~6 first,
-# and sanity-check that p99_ms clusters tightly across runs (roughly within 10%
-# of med_ms); if p99 is 2x+ the median, the host was busy and the numbers are
-# worthless. Interleaving means load drift shows up as a sign flip between
-# pairs rather than a fake win.
+# RESULT (2026-08-17, 6 pairs, rt 256): the cost is essentially ZERO.
+#   med_ms 18.407 off vs 18.381 on  (-0.1%), p99 within 5% of median for both.
+# Agrees with a +1.5% forced-peak measurement and with the structural argument
+# that the tone map adds no pass (WoW's X8R8G8B8 swizzle already forces present
+# down the sample-pass path).
+#
+# HOW THIS RUN NEARLY LIED, because it will lie again on a busy host: the first
+# four pairs showed HDR-on medians of 34-53 ms against an off-minimum of 20.7,
+# an apparent +67%, and a separate single run showed 6.67 -> 10.20 ms (+53%).
+# All of it was host contamination and it was reported as a real framerate trade
+# before the quiet pairs arrived. min-of-N IS load-robust in principle (noise is
+# additive) but only once EVERY variant has found a quiet window, and at that
+# point only the off side had.
+#
+# RUN THIS ON AN IDLE MACHINE. Require `sysctl -n vm.loadavg` under ~6, and
+# require p99_ms within ~10% of med_ms PER RUN — that is the tell that was
+# missing from the misleading rounds (p99 was 3-12x the median in every one of
+# them, within 5% in the truthful ones). Discard any run that fails it no matter
+# how plausible the number looks, and never compare minima until both sides have
+# a tight-p99 run. Even the '20.4-21.1 clean baseline' used earlier on this
+# branch was somewhat loaded; the real floor is 18.4.
 #
 #   bash tools/ab-hdr-cost.sh            # 4 pairs, 150 frames, BENCH_RT=256
 #   PAIRS=8 bash tools/ab-hdr-cost.sh    # more pairs = better resolution

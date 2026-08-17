@@ -115,9 +115,31 @@ enum d9mt_layer_colorspace {
   D9MT_COLORSPACE_DISPLAY_EXTENDED_LINEAR = 0,
 };
 
+/* refresh mode for d9mt_layer_edr_params */
+enum d9mt_layer_edr_refresh {
+  /* Answer from the published snapshot and do nothing else. */
+  D9MT_EDR_READ_ONLY = 0,
+  /* Answer from the snapshot, then queue an async main-queue re-read for next
+   * time. The ONLY mode the per-present path may use. */
+  D9MT_EDR_REFRESH_ASYNC = 1,
+  /* Walk NOW on the main queue and publish before returning, so the caller
+   * sees a real value rather than the seed.
+   *
+   * Required by the one-shot capability gate: the gate latches on its first
+   * answer, and an async refresh cannot possibly have landed by then, so the
+   * gate would read the 1.0 seed, conclude "no EDR headroom" and pin HDR off
+   * for the process -- on every machine, however capable the display.
+   *
+   * Safe only at configure time, and only because the caller's own call stack
+   * already hops to the main queue moments later (MetalLayer_setProps,
+   * D9MT_FUNC_LAYER_COLORSPACE), so this introduces no new blocking class.
+   * NEVER use this per frame. */
+  D9MT_EDR_REFRESH_SYNC = 2,
+};
+
 struct d9mt_layer_edr_params {
   uint64_t layer;             /* in:  CAMetalLayer handle                        */
-  uint32_t refresh;           /* in:  1 = also queue a main-queue re-read        */
+  uint32_t refresh;           /* in:  enum d9mt_layer_edr_refresh                */
   uint32_t ret_published;     /* out: 1 if a main-queue walk has ever completed  */
   float    ret_max_edr;       /* out: live headroom multiplier, or 1.0           */
   float    ret_max_potential; /* out: static panel ceiling, or 1.0               */

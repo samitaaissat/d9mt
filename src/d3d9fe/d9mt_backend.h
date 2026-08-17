@@ -207,12 +207,16 @@ namespace dxvk::d9mt {
   //                this is a separate pipeline, not the curve with a no-op
   //                target.
   //   Bt2446       BT.2446-A inverse tone map in ICtCp, extended-linear out.
-  //   Bt2446Pq     the same curve, ST.2084/BT.2020 encoded. Not mtld3d parity.
+  //   PassthroughPq the same sRGB decode, but PQ-encoded -- the sub-unity
+  //                fallback for a PQ-tagged layer. Emitting extended-linear
+  //                into a PQ layer would be the wrong transfer function.
+  //   Bt2446Pq     the curve, ST.2084/BT.2020 encoded. Not mtld3d parity.
   enum class HdrMode : uint32_t {
-    None        = 0,
-    Passthrough = 1,
-    Bt2446      = 2,
-    Bt2446Pq    = 3,
+    None          = 0,
+    Passthrough   = 1,
+    Bt2446        = 2,
+    PassthroughPq = 3,
+    Bt2446Pq      = 4,
   };
 
   // Uniform block for the HDR fragments, bound at fragment buffer(2).
@@ -237,6 +241,7 @@ namespace dxvk::d9mt {
   void     refreshHdrHeadroom(obj_handle_t layer);
   bool     hdrWantsPq();
   bool     hdrEvaluateGate(obj_handle_t layer);
+  bool     hdrGateLatched();
   void     hdrApplyColorSpace(obj_handle_t layer);
 
   // Depth(+stencil) SAMPLE_ZERO resolve PSO (d9mt_presenter.cpp): fullscreen

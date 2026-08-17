@@ -33,10 +33,12 @@
 #include "d9mt_hud.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -469,6 +471,20 @@ constant float3x3 D9MT_M_BT709_TO_BT2020 = float3x3(
     float3(0.3292830f, 0.9195404f, 0.0880133f),
     float3(0.0433131f, 0.0113623f, 0.8955953f));
 
+// PQ counterpart of the passthrough variant. Selected when the layer is tagged
+// PQ but live headroom is <= 1.0. Without it that case would emit
+// extended-linear values into a PQ-tagged layer, i.e. the wrong transfer
+// function entirely, which is far more wrong than a dark image.
+fragment float4 d9mt_blit_ps_hdr_passthrough_pq(
+    d9mt_blit_vout in [[stage_in]],
+    constant d9mt_blit_params& p [[buffer(0)]],
+    texture2d<float> src [[texture(0)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 c = src.sample(s, p.uv_offset + in.uv * p.uv_scale);
+  float3 nits2020 = D9MT_M_BT709_TO_BT2020 * (d9mt_srgb_eotf(c.rgb) * D9MT_L_SDR);
+  return float4(d9mt_pq_oetf(clamp(nits2020, 0.0f, 10000.0f)), c.a);
+}
+
 fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     d9mt_blit_vout in [[stage_in]],
     constant d9mt_blit_params& p [[buffer(0)]],
@@ -491,6 +507,7 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     obj_handle_t s_blitPsGamma = 0;
     obj_handle_t s_blitPsPointGamma = 0;
     obj_handle_t s_blitPsHdrPassthrough = 0;
+    obj_handle_t s_blitPsHdrPassthroughPq = 0;
     obj_handle_t s_blitPsHdrBt2446 = 0;
     obj_handle_t s_blitPsHdrBt2446Pq = 0;
     std::vector<std::pair<uint32_t, obj_handle_t>> s_blitPsoCache;
@@ -505,7 +522,8 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
 
     bool ensureBlitFunctionsLocked() {
       if (s_blitVs && s_blitPs && s_blitPsPoint && s_blitPsGamma && s_blitPsPointGamma
-       && s_blitPsHdrPassthrough && s_blitPsHdrBt2446 && s_blitPsHdrBt2446Pq)
+       && s_blitPsHdrPassthrough && s_blitPsHdrPassthroughPq
+       && s_blitPsHdrBt2446 && s_blitPsHdrBt2446Pq)
         return true;
       if (s_blitInitFailed)
         return false;
@@ -547,11 +565,13 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
       s_blitPsGamma = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_gamma");
       s_blitPsPointGamma = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_point_gamma");
       s_blitPsHdrPassthrough = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_passthrough");
+      s_blitPsHdrPassthroughPq = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_passthrough_pq");
       s_blitPsHdrBt2446 = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446");
       s_blitPsHdrBt2446Pq = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446_pq");
 
       if (!s_blitVs || !s_blitPs || !s_blitPsPoint || !s_blitPsGamma || !s_blitPsPointGamma
-       || !s_blitPsHdrPassthrough || !s_blitPsHdrBt2446 || !s_blitPsHdrBt2446Pq) {
+       || !s_blitPsHdrPassthrough || !s_blitPsHdrPassthroughPq
+       || !s_blitPsHdrBt2446 || !s_blitPsHdrBt2446Pq) {
         Logger::err("d9mt: blitter: blit functions missing from compiled library");
         s_blitInitFailed = true;
         return false;
@@ -567,12 +587,12 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
                           HdrMode hdrMode) {
     std::lock_guard<std::mutex> lock(s_blitMutex);
 
-    // dstFormat maxes out at 236, so bits 8-29 were free; hdrMode takes 28-29
-    // and leaves the existing bit-31/30 meanings untouched. With
-    // hdrMode == None the key is bit-identical to the pre-HDR one, which is
-    // what keeps the SDR PSO cache unchanged.
+    // dstFormat maxes out at 236 (8 bits), so bits 8-29 were free. hdrMode
+    // needs THREE bits (5 modes) and must not touch bit 30/31, so it sits at
+    // 24-26. With hdrMode == None the key is bit-identical to the pre-HDR one,
+    // which is what keeps the SDR PSO cache unchanged.
     uint32_t key = uint32_t(dstFormat)
-                 | (uint32_t(hdrMode) << 28)
+                 | (uint32_t(hdrMode) << 24)
                  | (pointFilter ? 0x80000000u : 0u)
                  | (useGamma ? 0x40000000u : 0u);
 
@@ -597,9 +617,10 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     // not multiply with pointFilter/useGamma (gamma is mutually exclusive with
     // HDR -- see DxvkSwapchainBlitter::present).
     switch (hdrMode) {
-      case HdrMode::Passthrough: info.fragment_function = s_blitPsHdrPassthrough; break;
-      case HdrMode::Bt2446:      info.fragment_function = s_blitPsHdrBt2446;      break;
-      case HdrMode::Bt2446Pq:    info.fragment_function = s_blitPsHdrBt2446Pq;    break;
+      case HdrMode::Passthrough:   info.fragment_function = s_blitPsHdrPassthrough;   break;
+      case HdrMode::PassthroughPq: info.fragment_function = s_blitPsHdrPassthroughPq; break;
+      case HdrMode::Bt2446:        info.fragment_function = s_blitPsHdrBt2446;        break;
+      case HdrMode::Bt2446Pq:      info.fragment_function = s_blitPsHdrBt2446Pq;      break;
       case HdrMode::None:
         info.fragment_function = useGamma ? (pointFilter ? s_blitPsPointGamma : s_blitPsGamma)
                                           : (pointFilter ? s_blitPsPoint : s_blitPs);
@@ -645,26 +666,42 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     enum class HdrEnv : uint32_t { Off = 0, On = 1, Auto = 2 };
     enum class HdrSpace : uint32_t { Display = 0, ScRgb = 1, Pq = 2 };
 
-    std::atomic<bool>  s_hdrActive  = { false };
-    std::atomic<float> s_hdrPeak    = { 1.0f };
-    std::atomic<bool>  s_hdrLatched = { false };   // gate has been evaluated
-    HdrSpace           s_hdrSpace   = HdrSpace::Display;
+    std::atomic<bool>     s_hdrActive     = { false };
+    std::atomic<float>    s_hdrPeak       = { 1.0f };
+    std::atomic<float>    s_hdrLoggedPeak = { 1.0f }; // drift-log baseline
+    std::atomic<bool>     s_hdrLatched    = { false }; // gate evaluated
+    std::atomic<uint32_t> s_hdrPresents   = { 0u };    // refresh cadence counter
+    HdrSpace              s_hdrSpace      = HdrSpace::Display;
 
-    bool envFlagEquals(const char* name, const char* value) {
+    // Case-insensitive, whitespace-trimmed env read. Without this a stray
+    // "TRUE" or a trailing space silently means "off", which is the worst
+    // possible failure mode for a feature whose absence looks like success.
+    std::string envLower(const char* name) {
       const char* v = std::getenv(name);
-      return v && std::strcmp(v, value) == 0;
+      if (!v)
+        return std::string();
+      std::string s(v);
+      size_t b = s.find_first_not_of(" \t\r\n");
+      size_t e = s.find_last_not_of(" \t\r\n");
+      s = (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+      for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      return s;
     }
 
     HdrEnv hdrEnvMode() {
       static const HdrEnv mode = [] {
-        const char* v = std::getenv("D9MT_HDR");
+        std::string v = envLower("D9MT_HDR");
         // Default OFF for this drop: the user A/Bs by relaunching, and a
-        // regression cannot cost them a raid night. Flip to Auto once
-        // in-game parity against mtld3d is signed off.
-        if (!v)
+        // regression cannot cost them a raid night. Flip to Auto once in-game
+        // parity against mtld3d is signed off.
+        if (v.empty())
           return HdrEnv::Off;
-        if (!std::strcmp(v, "1") || !std::strcmp(v, "on"))   return HdrEnv::On;
-        if (!std::strcmp(v, "auto"))                          return HdrEnv::Auto;
+        if (v == "1" || v == "on" || v == "true" || v == "yes")  return HdrEnv::On;
+        if (v == "auto")                                        return HdrEnv::Auto;
+        if (v == "0" || v == "off" || v == "false" || v == "no") return HdrEnv::Off;
+        Logger::warn(str::format("d9mt: hdr: D9MT_HDR='", v,
+          "' not recognised (want 0/1/auto) - treating as off"));
         return HdrEnv::Off;
       }();
       return mode;
@@ -672,22 +709,39 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
 
     HdrSpace hdrEnvSpace() {
       static const HdrSpace space = [] {
-        // Display = the panel's own profile, extended-linearized. This is
-        // mtld3d's `color.space = passthrough` default and therefore what the
-        // approved look was tested against.
-        if (envFlagEquals("D9MT_HDR_COLORSPACE", "scrgb")) return HdrSpace::ScRgb;
-        if (envFlagEquals("D9MT_HDR_COLORSPACE", "pq"))    return HdrSpace::Pq;
+        // Display = the panel's own profile, extended-linearized. mtld3d's
+        // `color.space = passthrough` default, i.e. what the approved look was
+        // tested against.
+        std::string v = envLower("D9MT_HDR_COLORSPACE");
+        if (v.empty() || v == "display") return HdrSpace::Display;
+        if (v == "scrgb")                return HdrSpace::ScRgb;
+        if (v == "pq")                   return HdrSpace::Pq;
+        Logger::warn(str::format("d9mt: hdr: D9MT_HDR_COLORSPACE='", v,
+          "' not recognised (want display/scrgb/pq) - using display"));
         return HdrSpace::Display;
       }();
       return space;
     }
 
     // Debug override: pin the curve's peak instead of following the display.
+    // Documented and accepted in NITS (the same unit the log lines print), and
+    // converted to the headroom multiplier the uniforms want. 0 = follow the
+    // display. An out-of-range value warns rather than being dropped in
+    // silence.
     float hdrEnvPeakOverride() {
       static const float peak = [] {
-        const char* v = std::getenv("D9MT_HDR_PEAK");
-        double d = v ? std::atof(v) : 0.0;
-        return (d > 1.0 && d < 100.0) ? float(d) : 0.0f;
+        std::string v = envLower("D9MT_HDR_PEAK");
+        if (v.empty())
+          return 0.0f;
+        double nits = std::atof(v.c_str());
+        if (nits >= 100.0 && nits <= 10000.0) {
+          Logger::info(str::format("d9mt: hdr: D9MT_HDR_PEAK=", nits,
+            " nits pinned (headroom ", nits / 100.0, "x)"));
+          return float(nits / 100.0);
+        }
+        Logger::warn(str::format("d9mt: hdr: D9MT_HDR_PEAK='", v,
+          "' out of range (want 100..10000 nits) - following the display"));
+        return 0.0f;
       }();
       return peak;
     }
@@ -748,18 +802,20 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     // MetalLayer_getEDRValue: that walks layer.delegate -> NSView -> NSWindow
     // -> NSScreen on the calling thread, and those are main-thread-only.
     // refresh=true also queues a main-queue re-read for next time.
-    bool queryLayerEdr(obj_handle_t layer, bool refresh, float* outCur, float* outPotential) {
+    bool queryLayerEdr(obj_handle_t layer, uint32_t mode,
+                       float* outCur, float* outPotential, bool* outPublished = nullptr) {
       if (!layer || !d9mtmetalHas(D9MT_FUNC_LAYER_EDR))
         return false;
 
       d9mt_layer_edr_params p = { };
       p.layer   = uint64_t(layer);
-      p.refresh = refresh ? 1u : 0u;
+      p.refresh = mode;
       if (D9MT_UnixCall(D9MT_FUNC_LAYER_EDR, &p) != 0)
         return false;
 
       if (outCur)       *outCur = p.ret_max_edr;
       if (outPotential) *outPotential = p.ret_max_potential;
+      if (outPublished) *outPublished = p.ret_published != 0u;
       return true;
     }
 
@@ -773,21 +829,27 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     if (!s_hdrActive.load(std::memory_order_relaxed))
       return;
 
-    static uint32_t counter = 0;
-    // seeded already-due so the very first present triggers a walk
-    bool due = (counter++ % 32u) == 0u;
-
-    float cur = 1.0f;
-    if (!queryLayerEdr(layer, due, &cur, nullptr))
+    // Only cross into the unixlib on a due present. The call itself is cheap
+    // (it reads published statics) but this driver is CPU-bound and a PE->unix
+    // crossing under Rosetta is ~1.5us, so paying it 32x more often than the
+    // design says is a real, if small, waste.
+    uint32_t n = s_hdrPresents.fetch_add(1u, std::memory_order_relaxed);
+    if ((n % 32u) != 0u)   // n starts at 0, so the first present is due
       return;
 
-    float prev = s_hdrPeak.load(std::memory_order_relaxed);
+    float cur = 1.0f;
+    if (!queryLayerEdr(layer, D9MT_EDR_REFRESH_ASYNC, &cur, nullptr))
+      return;
+
     s_hdrPeak.store(cur, std::memory_order_relaxed);
 
-    // Log only past 5% drift, or the first time we leave 1.0 — otherwise this
-    // would spam once per brightness tick.
-    if (std::fabs(cur - prev) > 0.05f * std::max(prev, 1.0f)) {
-      Logger::info(str::format("d9mt: hdr: headroom ", prev, "x -> ", cur,
+    // Log only past 5% drift from the last LOGGED value, not the last seen
+    // one: comparing against the previous sample lets a slow ramp creep
+    // arbitrarily far without ever tripping the threshold.
+    float logged = s_hdrLoggedPeak.load(std::memory_order_relaxed);
+    if (std::fabs(cur - logged) > 0.05f * std::max(logged, 1.0f)) {
+      s_hdrLoggedPeak.store(cur, std::memory_order_relaxed);
+      Logger::info(str::format("d9mt: hdr: headroom ", logged, "x -> ", cur,
         "x (L_hdr=", cur * 100.0f, " nits)"));
     }
   }
@@ -803,18 +865,42 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     if (!layer)
       return s_hdrActive.load(std::memory_order_relaxed);
 
-    if (!s_hdrLatched.exchange(true)) {
-      bool want = hdrEnvMode() != HdrEnv::Off;
-      float cur = 1.0f, potential = 1.0f;
-      bool haveEdr = want && queryLayerEdr(layer, true, &cur, &potential);
-      bool active = want && haveEdr && std::isfinite(potential) && potential > 1.0f;
+    if (hdrEnvMode() == HdrEnv::Off) {
+      // Resolve + log once even when disabled, so a typo in D9MT_HDR is visible
+      // rather than silently meaning "off".
+      if (!s_hdrLatched.exchange(true))
+        Logger::info("d9mt: hdr: disabled (D9MT_HDR)");
+      return false;
+    }
 
+    // Read SYNCHRONOUSLY. This is the one-shot gate: it latches on this single
+    // answer, so an async refresh cannot have landed yet -- we would read the
+    // 1.0 seed, conclude "no headroom" and pin HDR off on EVERY machine no
+    // matter how capable the panel.
+    float cur = 1.0f, potential = 1.0f;
+    bool published = false;
+    bool haveEdr = queryLayerEdr(layer, D9MT_EDR_REFRESH_SYNC,
+                                 &cur, &potential, &published);
+
+    // Never latch off an unpublished snapshot: potential == 1.0 would then mean
+    // "nobody has looked yet", not "this display has no headroom". Leave the
+    // latch clear so the next acquire retries.
+    if (haveEdr && !published) {
+      Logger::warn("d9mt: hdr: EDR headroom not published yet - deferring the gate");
+      return false;
+    }
+
+    if (!s_hdrLatched.exchange(true)) {
+      // Set before s_hdrActive is published: readers only consult s_hdrSpace
+      // once s_hdrActive is true, so this ordering is safe by construction.
       s_hdrSpace = hdrEnvSpace();
 
-      if (want && !haveEdr) {
+      bool active = haveEdr && std::isfinite(potential) && potential > 1.0f;
+
+      if (!haveEdr) {
         Logger::warn("d9mt: hdr: requested, but this d9mtmetal has no main-queue "
                      "EDR entry point (stale unixlib) - running SDR");
-      } else if (want && !active) {
+      } else if (!active) {
         Logger::info(str::format("d9mt: hdr: no EDR headroom on this display "
           "(potential=", potential, "x) - running SDR"));
       } else if (active) {
@@ -823,6 +909,11 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
                           : s_hdrSpace == HdrSpace::Pq      ? "pq"
                                                             : "scrgb"));
       }
+      // Seed the live peak from the same synchronous read so the first present
+      // already picks the right variant instead of spending frames on
+      // passthrough.
+      s_hdrPeak.store(cur, std::memory_order_relaxed);
+      s_hdrLoggedPeak.store(cur, std::memory_order_relaxed);
       s_hdrActive.store(active, std::memory_order_relaxed);
     }
     return s_hdrActive.load(std::memory_order_relaxed);
@@ -831,6 +922,11 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
   void hdrApplyColorSpace(obj_handle_t layer) { applyHdrColorSpaceLocked(layer); }
 
   bool hdrLayerActive() { return s_hdrActive.load(std::memory_order_relaxed); }
+
+  // True once the gate has reached a verdict. While false, recreateSwapChain
+  // must not take its unchanged-swapchain early-return, or a deferred gate
+  // would never get a second attempt.
+  bool hdrGateLatched() { return s_hdrLatched.load(std::memory_order_relaxed); }
 
   bool hdrWantsPq() { return s_hdrSpace == HdrSpace::Pq; }
 
@@ -1473,14 +1569,20 @@ namespace dxvk {
     if (!extent.width || !extent.height)
       return VK_NOT_READY;
 
+    // One-shot HDR capability gate; see d9mt::hdrEvaluateGate. Evaluated BEFORE
+    // the unchanged-swapchain early-return below, because the gate can decline
+    // to latch (headroom not published yet) and must then get another attempt.
+    // If it were behind the early-return, the first call would create the proxy
+    // and every later call would bail out here, leaving HDR stuck off until the
+    // window happened to resize.
+    const bool hdr = d9mt::hdrEvaluateGate(state.layer);
+
     if (state.proxy != nullptr
      && state.proxyExtent.width  == extent.width
      && state.proxyExtent.height == extent.height
-     && !m_dirtySwapchain)
+     && !m_dirtySwapchain
+     && d9mt::hdrGateLatched())
       return VK_SUCCESS;
-
-    // One-shot HDR capability gate; see d9mt::hdrEvaluateGate.
-    const bool hdr = d9mt::hdrEvaluateGate(state.layer);
 
     // resize the layer's drawables; framebuffer_only=false is REQUIRED
     // (the drawable is a blit destination, not a render target)
@@ -1637,11 +1739,11 @@ namespace dxvk {
       // 1.0 until it actually promotes the screen, so this is the state every
       // session starts in — without the short-circuit the first frames are
       // visibly crushed.
-      hdrMode = (hdrPeakValue > 1.0f) ? d9mt::HdrMode::Bt2446
-                                 : d9mt::HdrMode::Passthrough;
-
-      if (hdrMode == d9mt::HdrMode::Bt2446 && d9mt::hdrWantsPq())
-        hdrMode = d9mt::HdrMode::Bt2446Pq;
+      // The encode must always match the layer's tag, curve or no curve.
+      const bool pq = d9mt::hdrWantsPq();
+      hdrMode = (hdrPeakValue > 1.0f)
+              ? (pq ? d9mt::HdrMode::Bt2446Pq      : d9mt::HdrMode::Bt2446)
+              : (pq ? d9mt::HdrMode::PassthroughPq : d9mt::HdrMode::Passthrough);
 
       // Gamma and HDR are mutually exclusive, HDR wins (DXMT takes the same
       // posture). Applying the ramp first would feed a display-referred LUT

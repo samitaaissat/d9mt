@@ -909,16 +909,55 @@ static _Atomic float    g_edr_max_potential = 1.0f;
 static _Atomic uint32_t g_edr_published = 0;
 static _Atomic uint32_t g_edr_inflight = 0;
 
+/* main thread only; publishes into the statics */
+static void d9mt_edr_walk_and_publish(CAMetalLayer *layer) {
+  NSScreen *screen = d9mt_screen_for_layer(layer);
+  if (!screen)
+    return;
+
+  float cur = (float)screen.maximumExtendedDynamicRangeColorComponentValue;
+  float pot = (float)screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  /* AppKit reports 0 for "unknown" on some paths; 1.0 is the identity value
+   * the present shader treats as "no headroom". */
+  if (!(cur >= 1.0f) || !isfinite(cur))
+    cur = 1.0f;
+  if (!(pot >= 1.0f) || !isfinite(pot))
+    pot = 1.0f;
+
+  atomic_store_explicit(&g_edr_max, cur, memory_order_relaxed);
+  atomic_store_explicit(&g_edr_max_potential, pot, memory_order_relaxed);
+  /* release: publishes the two values above to any thread that observes the
+   * flag with acquire (see the load in d9mt_layer_edr). */
+  atomic_store_explicit(&g_edr_published, 1u, memory_order_release);
+}
+
 static NTSTATUS d9mt_layer_edr(void *args) {
   struct d9mt_layer_edr_params *p = args;
 
-  /* Answer from the published snapshot FIRST — this call must never block and
-   * must never touch AppKit on the caller's thread. */
+  /* Synchronous mode: walk before answering. This exists because the caller
+   * that latches the capability gate gets exactly one answer, and an async
+   * refresh cannot have landed by then -- it would read the seed and pin HDR
+   * off forever. Configure-time only; see d9mt_layer_edr_refresh. */
+  if (p->refresh == D9MT_EDR_REFRESH_SYNC && p->layer) {
+    CAMetalLayer *layer = (CAMetalLayer *)(uintptr_t)p->layer;
+    [layer retain];
+    d9mt_on_main_sync(^{
+      @autoreleasepool {
+        d9mt_edr_walk_and_publish(layer);
+      }
+    });
+    [layer release];
+  }
+
+  /* Answer from the published snapshot. In async/read-only mode this call must
+   * never block and must never touch AppKit on the caller's thread.
+   * Acquire on the flag pairs with the release store in the walk, so if
+   * ret_published is 1 the two values read after it are the published ones. */
+  p->ret_published     = atomic_load_explicit(&g_edr_published, memory_order_acquire);
   p->ret_max_edr       = atomic_load_explicit(&g_edr_max, memory_order_relaxed);
   p->ret_max_potential = atomic_load_explicit(&g_edr_max_potential, memory_order_relaxed);
-  p->ret_published     = atomic_load_explicit(&g_edr_published, memory_order_relaxed);
 
-  if (!p->refresh || !p->layer)
+  if (p->refresh != D9MT_EDR_REFRESH_ASYNC || !p->layer)
     return STATUS_SUCCESS;
 
   /* At most one outstanding walk. If the main thread is busy we simply keep
@@ -936,20 +975,7 @@ static NTSTATUS d9mt_layer_edr(void *args) {
 
   dispatch_async(dispatch_get_main_queue(), ^{
     @autoreleasepool {
-      NSScreen *screen = d9mt_screen_for_layer(layer);
-      if (screen) {
-        float cur = (float)screen.maximumExtendedDynamicRangeColorComponentValue;
-        float pot = (float)screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
-        /* AppKit reports 0 for "unknown" on some paths; 1.0 is the identity
-         * value the present shader treats as "no headroom". */
-        if (!(cur >= 1.0f) || !isfinite(cur))
-          cur = 1.0f;
-        if (!(pot >= 1.0f) || !isfinite(pot))
-          pot = 1.0f;
-        atomic_store_explicit(&g_edr_max, cur, memory_order_relaxed);
-        atomic_store_explicit(&g_edr_max_potential, pot, memory_order_relaxed);
-        atomic_store_explicit(&g_edr_published, 1u, memory_order_relaxed);
-      }
+      d9mt_edr_walk_and_publish(layer);
     }
     [layer release];
     atomic_store_explicit(&g_edr_inflight, 0u, memory_order_release);

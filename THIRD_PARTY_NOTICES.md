@@ -28,14 +28,17 @@ created; nothing was replaced.
 
 | d9mt file | mtld3d origin |
 | --- | --- |
-| `src/d3d9fe/d9mt_presenter.cpp` | `unix/unix/src/metal/present.msl` and the host-side pipeline/uniform logic in `unix/unix/src/metal/present.rs` |
+| `src/d3d9fe/d9mt_presenter.cpp` | `unix/unix/src/metal/present.msl` (the BT.2446-A/ICtCp fragment) and the host-side pipeline/uniform logic in `unix/unix/src/metal/{present,command}.rs` |
+| `src/d9mtmetal/unix.m`, `src/d9mtmetal/d9mtmetal.h` | the EDR-headroom publish design and 32-present refresh cadence in `unix/unix/src/metal/{macdrv,command}.rs` |
 
-**Status note (accuracy):** on branch `feat/hdr-bt2446`, the ported BT.2446-A
-code is present in `src/d3d9fe/d9mt_presenter.cpp` as an **embedded Metal
-Shading Language source string**, together with supporting host-side changes in
-`src/d9mtmetal/d9mtmetal.h` and `src/d9mtmetal/unix.m`. At the time of writing
-these changes are **uncommitted working-tree modifications**, not yet part of
-any commit. This table must be re-verified at the point the port is committed.
+**Status note (accuracy):** on branch `feat/hdr-bt2446` the ported BT.2446-A
+code lives in `src/d3d9fe/d9mt_presenter.cpp` as an **embedded Metal Shading
+Language source string**, with supporting host-side derivation in
+`src/d9mtmetal/d9mtmetal.h` and `src/d9mtmetal/unix.m` (both now carry their own
+mtld3d attribution headers). These are **committed** as of `c8f976e`
+("feat: HDR present pipeline") and its follow-ups; the table above is current
+for that branch. Nothing has been pushed to a remote, and no payload containing
+this code has been uploaded to a release.
 
 ### zlib licence — complete verbatim text
 

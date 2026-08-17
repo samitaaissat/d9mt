@@ -829,6 +829,44 @@ static struct {
 } g_pass_cache[D9MT_PASS_CACHE_N];
 static uint64_t g_pass_cache_clock;
 
+/* Hit-rate instrumentation, gated on D9MT_PASS_CACHE_STATS=1.
+ *
+ * The wall-clock A/B for this change is worth a few percent, which is inside
+ * the noise of a busy host. The hit rate is not: it is a property of the
+ * workload, load-independent, and it is what decides whether the change does
+ * anything at all (a round-robin pool larger than the cache hits 0% -- see the
+ * sizing note above). So measure it directly rather than inferring it.
+ *
+ * Written to $TMPDIR/d9mt-passcache.txt because wine swallows stderr from the
+ * unix side. Refreshed every 4096 transitions, so ~8 frames of the rt bench. */
+static uint64_t g_pass_cache_hits, g_pass_cache_misses;
+
+static void d9mt_pass_cache_stats(void) {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *v = getenv("D9MT_PASS_CACHE_STATS");
+    enabled = (v && v[0] == '1') ? 1 : 0;
+  }
+  if (!enabled)
+    return;
+
+  uint64_t total = g_pass_cache_hits + g_pass_cache_misses;
+  if (total == 0 || (total & 4095u) != 0u)
+    return;
+
+  const char *tmp = getenv("TMPDIR");
+  char path[1024];
+  snprintf(path, sizeof(path), "%sd9mt-passcache.txt", tmp ? tmp : "/tmp/");
+  FILE *f = fopen(path, "w");
+  if (!f)
+    return;
+  fprintf(f, "transitions=%llu hits=%llu misses=%llu hit_rate=%.4f slots=%d\n",
+          (unsigned long long)total, (unsigned long long)g_pass_cache_hits,
+          (unsigned long long)g_pass_cache_misses,
+          (double)g_pass_cache_hits / (double)total, D9MT_PASS_CACHE_N);
+  fclose(f);
+}
+
 static uint64_t d9mt_fnv1a(const void *data, size_t len) {
   const unsigned char *p = data;
   uint64_t h = 1469598103934665603ull;
@@ -927,6 +965,8 @@ d9mt_pass_desc_for(const struct d9mt_wmt_render_pass_info *info) {
      && memcmp(&g_pass_cache[i].key, info, sizeof(*info)) == 0) {
       g_pass_cache[i].stamp = ++g_pass_cache_clock;
       out = g_pass_cache[i].desc;      /* HIT: zero ObjC messages */
+      g_pass_cache_hits++;
+      d9mt_pass_cache_stats();
       pthread_mutex_unlock(&g_pass_cache_lock);
       return out;
     }
@@ -947,6 +987,8 @@ d9mt_pass_desc_for(const struct d9mt_wmt_render_pass_info *info) {
   g_pass_cache[victim].digest = digest;
   g_pass_cache[victim].stamp = ++g_pass_cache_clock;
   out = g_pass_cache[victim].desc;
+  g_pass_cache_misses++;
+  d9mt_pass_cache_stats();
 
   pthread_mutex_unlock(&g_pass_cache_lock);
   return out;

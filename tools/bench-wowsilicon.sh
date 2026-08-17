@@ -22,8 +22,14 @@
 #     result files (*_out.txt) therefore land in $GAME.
 #   - WINESERVER is pinned to the runtime copy (wine cannot derive
 #     <bin>/wineserver under the nested game .app layout).
-#   - ROSETTA_X87_PATH points at wine-rosetta-shim: wine execs it for i386
-#     images (rosettax87 + Game Mode loader geometry).
+#   - X87_SIDECAR_PATH points at wine-rosetta-shim: wine (runtime patch 0002)
+#     re-execs i386 images as [$X87_SIDECAR_PATH, --cooperative, loader, ...],
+#     and the shim rewrites the loader arg to wine-gamemode and execs
+#     x87sidecar beside it (Game Mode loader geometry preserved).
+#     NOTE: the legacy ROSETTA_X87_PATH var is what pass-3 used; runtime-v4
+#     replaced rosettax87 with athei/x87sidecar, and setting the OLD var makes
+#     the shim try to execv a rosettax87 that no longer ships ("execv
+#     rosettax87: No such file or directory").
 #   - winemetal/d9mtmetal must resolve as WINE BUILTINS for the native
 #     d3d9.dll's imports: the PE stubs are staged into the prefix
 #     (system32/syswow64/x86_64-unix) and registered builtin via
@@ -69,7 +75,7 @@ wine_do() {
     MTL_HUD_ENABLED=0 \
     D9MT_METALLIB_CACHE=1 \
     D9MT_ASYNC=1 \
-    ROSETTA_X87_PATH="$RT/Contents/MacOS/wine-rosetta-shim" \
+    X87_SIDECAR_PATH="$RT/Contents/MacOS/wine-rosetta-shim" \
     PATH="$RT/Contents/MacOS:$PATH" \
     ${WINE_ENV_EXTRA[@]+"${WINE_ENV_EXTRA[@]}"} \
     "$WINE" "$@"

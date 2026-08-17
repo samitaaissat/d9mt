@@ -100,6 +100,58 @@ Pass-2 baseline (payload v3, 16k draws / 256 rt round-trips):
   block offset, matching the FE write side's
   computePushDataBlockOffset(index) + offset memcpy).
 
+## Pass 4 measured NEGATIVE result — descriptor construction is NOT the residual
+
+**Claim tested:** that the cost remaining after pass-2's encoder fusion is the
+per-restart `MTLRenderPassDescriptor` construction (one autoreleased alloc plus
+~33 `objc_msgSend` property writes, ~1024x/frame in `rt` mode). This was the
+top-ranked pass-4 candidate.
+
+**What was built:** a hash-indexed (FNV-1a) pool of 16 retained descriptors in
+d9mtmetal keyed on the full `WMTRenderPassInfo`, serving repeats with ZERO ObjC
+messages. Mutex-guarded; explicit clearing of every field a reused descriptor
+would otherwise inherit.
+
+**Mechanism confirmed:** `D9MT_PASS_CACHE_STATS=1` reports
+`transitions=122880 hits=122841 misses=39 hit_rate=0.9997` over 120 frames at
+`BENCH_RT=256`. The 39 misses are the cold fill. So the work really is being
+eliminated, on essentially every restart.
+
+**Wall clock: no effect.** Interleaved ABAB, 4 pairs, 150 frames, on a quiet
+host (p99 clustered at 22.2-22.6 ms for 7 of 8 runs, load 8 -> 5.5):
+
+| pair | A med_ms | B med_ms | delta |
+|---|---|---|---|
+| 1 | 21.136 | 20.820 | -1.50% |
+| 2 | 20.854 | 20.675 | -0.86% |
+| 3 | 20.183 | 20.758 | +2.85% |
+| 4 | 20.640 | 20.977 | +1.63% |
+
+The sign flips; mean paired delta is +0.5%. Resolution on this host is about
++-2%, so the true effect is inside [-2%, +2%].
+
+**Conclusion, and what it redirects:** descriptor construction is not a
+meaningful share of the pass-restart cost. Either these property setters are far
+cheaper under Rosetta than the ~30ns/message estimate the candidate was sized
+with, or the cost genuinely sits where `PERF-ROADMAP` originally said it did —
+in the native `renderCommandEncoderWithDescriptor:` / `endEncoding` work itself.
+**Do not re-derive this candidate**, and do not size future candidates by
+counting `objc_msgSend`s: this is the second time (after pass-3 W2's predicted
+10-12% measuring ~1%) that an operation-count model has over-predicted by an
+order of magnitude.
+
+Corollary for the remaining pass-4 candidates: those whose entire thesis is
+"fewer CPU operations per restart" (the argument-buffer content cache, the
+cheap-cleanup bundle, the PSO re-dirty removal) inherit this doubt and should be
+measured on a quiet host BEFORE being written, not after.
+
+**Bench-rig caveat that cost most of the measurement time:** this host is a
+managed Mac with CrowdStrike (~143% CPU) and Mosyle (~122%) resident, and had a
+Virtualization.framework VM at 267% plus concurrent swift builds. At load 20-52
+`rt` frame times inflate 2.2x *for both variants*, and an unattended A/B produced
+medians ranging 4.5-62 ms. Gate on `sysctl -n vm.loadavg < 6` and check p99
+clustering before trusting anything.
+
 ## Validation gaps (pass 3) — must close before shipping
 
 - spectest is env-blocked machine-wide this pass (no 3.3.5a client

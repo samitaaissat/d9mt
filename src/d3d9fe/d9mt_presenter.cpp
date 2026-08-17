@@ -1727,11 +1727,16 @@ namespace dxvk {
     // HDR present variant. Keyed off the DESTINATION format so this can only
     // ever engage on the fp16 proxy the HDR gate created — a stray blit into
     // anything else keeps HdrMode::None.
-    WMTPixelFormat dstFmtEarly = d9mt::wmtFormatFor(dstView->info().format);
+    //
+    // hdrLayerActive() is tested FIRST and short-circuits: it is one relaxed
+    // atomic load, whereas wmtFormatFor is a linear scan of the ~55-entry
+    // format table. With HDR off this whole block therefore costs one atomic
+    // load, which is what "the SDR path is unchanged" has to mean.
     d9mt::HdrMode hdrMode = d9mt::HdrMode::None;
     float hdrPeakValue = 1.0f;
 
-    if (d9mt::hdrLayerActive() && dstFmtEarly == WMTPixelFormatRGBA16Float) {
+    if (d9mt::hdrLayerActive()
+     && d9mt::wmtFormatFor(dstView->info().format) == WMTPixelFormatRGBA16Float) {
       hdrPeakValue = d9mt::hdrPeak();
       // BT.2446-A is NOT identity at L_hdr == L_sdr (it under-corrects by
       // ~28% at mid grey), so below/at unity headroom we must run a plain

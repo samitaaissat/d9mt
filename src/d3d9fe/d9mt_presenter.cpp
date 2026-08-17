@@ -587,10 +587,12 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
                           HdrMode hdrMode) {
     std::lock_guard<std::mutex> lock(s_blitMutex);
 
-    // dstFormat maxes out at 236 (8 bits), so bits 8-29 were free. hdrMode
-    // needs THREE bits (5 modes) and must not touch bit 30/31, so it sits at
-    // 24-26. With hdrMode == None the key is bit-identical to the pre-HDR one,
-    // which is what keeps the SDR PSO cache unchanged.
+    // WMTPixelFormat's largest value is 555, i.e. TEN bits (0-9) -- NOT the
+    // 8 an earlier note claimed, so bits 8-9 are taken and a field placed
+    // there would collide with the format. hdrMode needs three bits (5 modes)
+    // and must clear bits 30/31, so it sits at 24-26. With hdrMode == None the
+    // shift contributes 0 and the key is bit-identical to the pre-HDR
+    // expression, which is what keeps the SDR PSO cache unchanged.
     uint32_t key = uint32_t(dstFormat)
                  | (uint32_t(hdrMode) << 24)
                  | (pointFilter ? 0x80000000u : 0u)

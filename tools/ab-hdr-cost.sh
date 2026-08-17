@@ -30,10 +30,12 @@
 #
 # Requires `tools/bench-wowsilicon.sh install` to have been run first.
 set -euo pipefail
-ROOT=/Users/sami.taaissat/Documents/Perso/WoWSilicon/.d9mt-work/d9mt
-SCR=/private/tmp/claude-502/-Users-sami-taaissat-Documents-Perso-WoWSilicon/9caaa54f-f0a1-4411-ba6c-07bb2e6ea56d/scratchpad
-export D9MT_RT_SRC="/Volumes/Perso/WoWSilicon Data/RuntimeUpdate/WoWSilicon Game.app"
-export D9MT_BENCH_ENV="$SCR/bench-env"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Both of these are the same knobs tools/bench-wowsilicon.sh takes; set them in
+# the environment if your runtime or scratch dir live elsewhere.
+: "${D9MT_RT_SRC:=/Volumes/Perso/WoWSilicon Data/RuntimeUpdate/WoWSilicon Game.app}"
+: "${D9MT_BENCH_ENV:=$ROOT/../bench-env}"
+export D9MT_RT_SRC D9MT_BENCH_ENV
 PAIRS="${PAIRS:-4}"
 ARGS="${ARGS:-BENCH_MODE=rt BENCH_RT=256 BENCH_RTDRAWS=4 BENCH_FRAMES=150}"
 cd "$ROOT"

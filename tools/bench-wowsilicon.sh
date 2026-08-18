@@ -122,7 +122,7 @@ cmd_install() {
   echo "[bench-wowsilicon] staging d3d9.dll + test exes into $GAME"
   cp "$ROOT/build/d3d9fe.dll" "$GAME/d3d9.dll"
   local t
-  for t in bench consttest spectest depthbias resettest hdrtext; do
+  for t in bench consttest spectest depthbias resettest hdrtext rtdefer; do
     if [ -f "$ROOT/build/$t.exe" ]; then
       cp "$ROOT/build/$t.exe" "$GAME/"
     else

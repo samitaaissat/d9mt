@@ -226,6 +226,35 @@ namespace dxvk::d9mt {
     size_t               cmdArenaUsed = 0;
     wmtcmd_base*         cmdHead = nullptr;
     wmtcmd_base*         cmdTail = nullptr;
+
+    // ---- deferred main-pass batching (D9MT_PASS_DEFER, see passDeferEnabled)
+    // A lazily-opened render pass has kind==Render but no encoder yet: its
+    // descriptor is parked in pendingPass and its commands accumulate in the
+    // chain; the encoder is created at flush time. Lazy creation is what lets
+    // a SUSPENDED pass slot in AFTER interlude passes recorded later.
+    bool              passPending = false;
+    WMTRenderPassInfo pendingPass = { };
+    // Hazard tracking is by IMAGE identity, not Metal view handle: the RTV a
+    // pass renders through and the SRV a draw samples through are different
+    // Metal texture views of the same image.
+    static constexpr uint32_t MaxPassAttach   = 10u; // 8 color + depth + stencil
+    static constexpr size_t   MaxSampledTrack = 64u; // beyond this: flush-always
+    const void*       passAttach[MaxPassAttach] = { };
+    uint32_t          passAttachCount = 0u;
+    std::vector<const void*> passSampled;      // images sampled by pending-pass draws
+    bool              passSampledOverflow = false;
+    // the suspended pass: chain + descriptor + hazard sets parked while
+    // interlude passes run; arenaFloor keeps chain flushes from reclaiming
+    // the parked chain's arena bytes
+    bool              suspActive = false;
+    WMTRenderPassInfo suspPass = { };
+    wmtcmd_base*      suspHead = nullptr;
+    wmtcmd_base*      suspTail = nullptr;
+    const void*       suspAttach[MaxPassAttach] = { };
+    uint32_t          suspAttachCount = 0u;
+    std::vector<const void*> suspSampled;
+    bool              suspSampledOverflow = false;
+    size_t            arenaFloor = 0;
   };
 
   // Render-command arena capacity. Max single render command is well under
@@ -352,30 +381,476 @@ namespace dxvk::d9mt {
     return e;
   }
 
+  // Deferred main-pass batching (D9MT_PASS_DEFER=1, default OFF). WoW's unit
+  // shadows interrupt the main pass with dozens of tiny render-target passes
+  // per frame, and every return costs a fixed encoder create+end pair (~9.5us
+  // that no Metal flag reduces) plus the front-end restart tax. With the flag
+  // on, DxvkContext render passes open LAZILY (descriptor parked, commands
+  // chained, encoder created when the pass ends), which makes it legal to
+  // SUSPEND an interrupted pass and keep appending on return: within one
+  // MTLCommandBuffer passes execute in encoder-CREATION order, so the whole
+  // suspended pass encodes once, AFTER the interludes. Only safe while no
+  // interlude touches the suspended pass's attachments and nothing a
+  // suspended draw sampled is written again — the flush conditions below
+  // enforce that conservatively (when in doubt, flush).
+  static bool passDeferEnabled() {
+    static const bool e = [] {
+      const char* v = std::getenv("D9MT_PASS_DEFER");
+      // the suspended chain IS the batching arena chain; without it there
+      // is nothing to defer
+      return v && v[0] == '1' && v[1] == '\0' && batchRenderCmdsEnabled();
+    }();
+    return e;
+  }
+
+  // Suspend budget: refuse to park a chain that already ate most of the
+  // arena, so interlude passes always have headroom left (a single command
+  // is well under 256 bytes; overflow mid-interlude materializes early and
+  // is handled, but a parked floor near the cap must never happen).
+  constexpr size_t PassDeferSuspendBudget = (256u * 1024u) * 3u / 4u;
+
+  // D9MT_PASS_DEFER_STATS=1: proof the mechanism engages (same motivation as
+  // the pass-cache hit-rate counters: engagement is a workload property and
+  // load-independent, unlike wall clock on this host).
+  enum PassDeferFlushCause : uint32_t {
+    PassFlushHazard = 0,  // interlude binds an attachment a suspended draw sampled (W∩S reuse)
+    PassFlushAttach,      // interlude binds one of the suspended pass's attachments
+    PassFlushSampled,     // interlude draw samples one of the suspended pass's attachments
+    PassFlushClear,       // standalone clear pass while suspended
+    PassFlushBlit,        // blit encoder requested
+    PassFlushCompute,     // compute encoder requested
+    PassFlushSpill,       // spillRenderPass (copies, readbacks, barriers, ...)
+    PassFlushSubmit,      // command-list commit / finalize
+    PassFlushExternal,    // eager render pass (presenter, clear-with-draw, resolve)
+    PassFlushQuery,       // occlusion query begin/end or timestamp write
+    PassFlushStorage,     // draw binds a storage image (writes escape the attachments)
+    PassFlushCauseCount
+  };
+
+  struct PassDeferStats {
+    uint64_t deferredBegins = 0;
+    uint64_t suspends       = 0;
+    uint64_t resumes        = 0;
+    uint64_t capacitySkips  = 0; // suspend refused: chain over budget
+    uint64_t flushes[PassFlushCauseCount] = { };
+  };
+  static PassDeferStats s_passDeferStats;
+
+  static void passDeferLogStats(const char* when); // defined below
+
+  static bool passDeferStatsEnabled() {
+    static const bool e = [] {
+      const char* v = std::getenv("D9MT_PASS_DEFER_STATS");
+      bool on = v && v[0] == '1' && v[1] == '\0';
+      if (on)
+        std::atexit([] { passDeferLogStats("exit"); });
+      return on;
+    }();
+    return e;
+  }
+
+  static void passDeferLogStats(const char* when) {
+    // own file in the process cwd (release builds compile logf out, and
+    // winewrapper swallows stderr — same reasoning as the pass-cache
+    // hit-rate file); rewritten each dump with cumulative counters
+    FILE* out = std::fopen("d9mt_passdefer.txt", "w");
+    if (!out)
+      return;
+    const auto& s = s_passDeferStats;
+    const auto& f = s.flushes;
+    std::fprintf(out,
+         "pass-defer stats (%s): begins=%llu suspends=%llu resumes=%llu "
+         "capacity-skips=%llu flushes[hazard=%llu attach=%llu sampled=%llu "
+         "clear=%llu blit=%llu compute=%llu spill=%llu submit=%llu "
+         "external=%llu query=%llu storage=%llu]\n",
+      when,
+      (unsigned long long)s.deferredBegins,
+      (unsigned long long)s.suspends,
+      (unsigned long long)s.resumes,
+      (unsigned long long)s.capacitySkips,
+      (unsigned long long)f[PassFlushHazard],
+      (unsigned long long)f[PassFlushAttach],
+      (unsigned long long)f[PassFlushSampled],
+      (unsigned long long)f[PassFlushClear],
+      (unsigned long long)f[PassFlushBlit],
+      (unsigned long long)f[PassFlushCompute],
+      (unsigned long long)f[PassFlushSpill],
+      (unsigned long long)f[PassFlushSubmit],
+      (unsigned long long)f[PassFlushExternal],
+      (unsigned long long)f[PassFlushQuery],
+      (unsigned long long)f[PassFlushStorage]);
+    std::fclose(out);
+  }
+
+  static obj_handle_t ensureCmdBuf(CmdListState& state); // defined below
+
+  // Creates the Metal encoder for a lazily-opened render pass, with the pass
+  // descriptor the ORIGINAL begin built (hoisted-clear load actions intact —
+  // built once, encoded once). The pass stays open; the chain keeps the
+  // recording position. Failure drops the pass fail-loud like an eager begin.
+  static void materializePendingPass(CmdListState& state) {
+    state.passPending = false;
+
+    if (!ensureCmdBuf(state)) {
+      state.kind = EncoderKind::None;
+      return;
+    }
+
+    d9mt_pass_transition_params p = { };
+    p.cmdbuf   = state.cmdbuf;
+    p.pass_ptr = uint64_t(reinterpret_cast<uintptr_t>(&state.pendingPass));
+    D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
+
+    obj_handle_t enc = obj_handle_t(p.ret_encoder);
+    if (!enc) {
+      logf("d9mt: renderCommandEncoder failed (deferred pass %ux%u)",
+        state.pendingPass.render_target_width,
+        state.pendingPass.render_target_height);
+      state.kind = EncoderKind::None;
+      // drop the unencodable chain; referenced resources stay alive via the
+      // command list's tracking
+      state.cmdHead = nullptr;
+      state.cmdTail = nullptr;
+      state.cmdArenaUsed = state.arenaFloor;
+      return;
+    }
+
+    state.encoder = enc;
+  }
+
+  // A pass whose every attachment loads Load and stores Store, with no
+  // resolve and no visibility buffer, does nothing without draws.
+  static bool passIsNoOp(const WMTRenderPassInfo& pass) {
+    if (pass.visibility_buffer)
+      return false;
+    for (const auto& att : pass.colors) {
+      if (att.texture && (att.load_action != WMTLoadActionLoad
+                       || att.store_action != WMTStoreActionStore
+                       || att.resolve_texture))
+        return false;
+    }
+    if (pass.depth.texture && (pass.depth.load_action != WMTLoadActionLoad
+                            || pass.depth.store_action != WMTStoreActionStore))
+      return false;
+    if (pass.stencil.texture && (pass.stencil.load_action != WMTLoadActionLoad
+                              || pass.stencil.store_action != WMTStoreActionStore))
+      return false;
+    return true;
+  }
+
   // Hands the accumulated render-command chain to the bridge in a single
   // encodeCommands crossing, then resets the arena. No-op if empty or if the
   // encoder is gone. Must run before the render encoder ends or switches.
+  // A lazily-opened pass materializes its encoder here (arena overflow is
+  // the one path that flushes mid-pass — the pass then simply stops being
+  // suspendable, which is the "chain over capacity" flush condition).
   static void flushRenderCmds(CmdListState& state) {
     if (!state.cmdHead)
       return;
+    if (state.passPending)
+      materializePendingPass(state);
     if (state.kind == EncoderKind::Render && state.encoder)
       MTLRenderCommandEncoder_encodeCommands(state.encoder, state.cmdHead);
     state.cmdHead = nullptr;
     state.cmdTail = nullptr;
-    state.cmdArenaUsed = 0;
+    // never reclaim a parked (suspended) chain's bytes
+    state.cmdArenaUsed = state.arenaFloor;
   }
 
   static void endEncoder(CmdListState& state) {
-    if (state.encoder) {
-      flushRenderCmds(state); // drain pending render commands first
-      // fused end (endEncoding + release in one PE->unix crossing)
-      d9mt_pass_transition_params p = { };
-      p.old_encoder = state.encoder;
-      D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
-      state.encoder = 0;
+    if (state.passPending && !state.cmdHead) {
+      // lazily-opened pass that recorded nothing: only its load/store
+      // actions matter. All-Load/Store is a no-op — skip the encoder.
+      state.passPending = false;
+      state.kind = EncoderKind::None;
+      if (!passIsNoOp(state.pendingPass) && ensureCmdBuf(state)) {
+        // fused create+end, exactly like a standalone clear pass
+        d9mt_pass_transition_params p = { };
+        p.cmdbuf          = state.cmdbuf;
+        p.pass_ptr        = uint64_t(reinterpret_cast<uintptr_t>(&state.pendingPass));
+        p.end_immediately = 1;
+        D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
+        if (!p.padding)
+          logf("d9mt: renderCommandEncoder failed (deferred empty pass %ux%u)",
+            state.pendingPass.render_target_width,
+            state.pendingPass.render_target_height);
+      }
+    } else if (state.encoder || state.passPending) {
+      flushRenderCmds(state); // drain + materialize a lazily-opened pass
+      if (state.encoder) {
+        // fused end (endEncoding + release in one PE->unix crossing)
+        d9mt_pass_transition_params p = { };
+        p.old_encoder = state.encoder;
+        D9MT_UnixCall(D9MT_FUNC_PASS_TRANSITION, &p);
+        state.encoder = 0;
+      }
+      state.passPending = false;
       state.kind = EncoderKind::None;
     }
     state.visAttached = false;
+  }
+
+  // Materializes and ends the SUSPENDED pass (mandatory flush conditions all
+  // land here). The live recording — none, or a lazily-open pass that has no
+  // encoder yet — is parked around the flush, so the suspended pass's encoder
+  // is created first and the live pass keeps recording afterwards. Callers
+  // whose semantics need the live pass encoded BEFORE the suspended one
+  // (blit/submit/spill/external begin) call endEncoder first themselves.
+  static void flushSuspendedPass(CmdListState& state, PassDeferFlushCause cause) {
+    if (!state.suspActive)
+      return;
+
+    // park the live recording (empty-safe). While a suspension is live the
+    // render path only ever records lazily, so a live RENDER encoder cannot
+    // exist here; a lingering blit/compute encoder must end first so the
+    // suspended pass's render encoder can be created.
+    if (state.encoder)
+      endEncoder(state);
+
+    bool              livePending = state.passPending;
+    EncoderKind       liveKind    = state.kind;
+    WMTRenderPassInfo livePass    = state.pendingPass;
+    wmtcmd_base*      liveHead    = state.cmdHead;
+    wmtcmd_base*      liveTail    = state.cmdTail;
+    const void*       liveAttach[CmdListState::MaxPassAttach];
+    std::memcpy(liveAttach, state.passAttach, sizeof(liveAttach));
+    uint32_t          liveAttachCount = state.passAttachCount;
+    bool              liveOverflow    = state.passSampledOverflow;
+    state.passSampled.swap(state.suspSampled); // live set -> suspSampled slot
+
+    // un-suspend into the live slot and end it like any lazily-open pass
+    state.pendingPass = state.suspPass;
+    state.cmdHead     = state.suspHead;
+    state.cmdTail     = state.suspTail;
+    state.passPending = true;
+    state.kind        = EncoderKind::Render;
+    state.suspActive  = false;
+    state.suspHead    = nullptr;
+    state.suspTail    = nullptr;
+
+    // protect the parked live chain's arena bytes across the flush
+    size_t liveUsed  = state.cmdArenaUsed;
+    state.arenaFloor = liveUsed;
+    endEncoder(state);
+    state.cmdArenaUsed = liveUsed;
+    state.arenaFloor   = 0;
+
+    // restore the live recording
+    state.pendingPass = livePass;
+    state.cmdHead     = liveHead;
+    state.cmdTail     = liveTail;
+    state.passPending = livePending;
+    state.kind        = liveKind;
+    std::memcpy(state.passAttach, liveAttach, sizeof(liveAttach));
+    state.passAttachCount    = liveAttachCount;
+    state.passSampled.swap(state.suspSampled);
+    state.passSampledOverflow = liveOverflow;
+    state.suspSampled.clear();
+    state.suspSampledOverflow = false;
+    state.suspAttachCount     = 0u;
+
+    if (passDeferStatsEnabled())
+      s_passDeferStats.flushes[cause] += 1u;
+  }
+
+  // Parks the lazily-open pass being left so a later begin on the same
+  // attachment set can resume it. Caller checked eligibility (pending, no
+  // suspension yet, under budget, no visibility).
+  static void suspendPendingPass(CmdListState& state) {
+    state.suspPass = state.pendingPass;
+    state.suspHead = state.cmdHead;
+    state.suspTail = state.cmdTail;
+    std::memcpy(state.suspAttach, state.passAttach, sizeof(state.suspAttach));
+    state.suspAttachCount = state.passAttachCount;
+    state.suspSampled.swap(state.passSampled);
+    state.suspSampledOverflow = state.passSampledOverflow;
+    state.suspActive = true;
+
+    state.cmdHead = nullptr;
+    state.cmdTail = nullptr;
+    state.passPending = false;
+    state.kind = EncoderKind::None;
+    state.passSampled.clear();
+    state.passSampledOverflow = false;
+    state.passAttachCount = 0u;
+    // interlude chains reclaim only down to the parked chain's watermark
+    state.arenaFloor = state.cmdArenaUsed;
+
+    if (passDeferStatsEnabled())
+      s_passDeferStats.suspends += 1u;
+  }
+
+  // True when a lazily-built pass descriptor addresses exactly the suspended
+  // pass's attachments (texture view + level/slice/plane + geometry) and
+  // loads everything — i.e. appending to the suspended pass is equivalent.
+  // A Clear/DontCare load on the new begin must NOT resume: the clear would
+  // have to happen after the already-recorded draws, not at pass start.
+  static bool passResumesSuspended(const CmdListState& state,
+      const WMTRenderPassInfo& pass) {
+    const WMTRenderPassInfo& susp = state.suspPass;
+
+    if (pass.render_target_width  != susp.render_target_width
+     || pass.render_target_height != susp.render_target_height
+     || pass.render_target_array_length != susp.render_target_array_length
+     || pass.visibility_buffer)
+      return false;
+
+    for (uint32_t i = 0; i < 8u; i++) {
+      const auto& a = pass.colors[i];
+      const auto& b = susp.colors[i];
+      if (a.texture != b.texture)
+        return false;
+      if (a.texture && (a.level != b.level || a.slice != b.slice
+                     || a.depth_plane != b.depth_plane
+                     || a.load_action != WMTLoadActionLoad
+                     || a.resolve_texture))
+        return false;
+    }
+
+    if (pass.depth.texture != susp.depth.texture)
+      return false;
+    if (pass.depth.texture && (pass.depth.level != susp.depth.level
+                            || pass.depth.slice != susp.depth.slice
+                            || pass.depth.load_action != WMTLoadActionLoad))
+      return false;
+
+    if (pass.stencil.texture != susp.stencil.texture)
+      return false;
+    if (pass.stencil.texture && (pass.stencil.level != susp.stencil.level
+                              || pass.stencil.slice != susp.stencil.slice
+                              || pass.stencil.load_action != WMTLoadActionLoad))
+      return false;
+
+    return true;
+  }
+
+  // Interlude-begin hazard check against the suspended pass, by image:
+  //  (a) attaching one of the suspended pass's attachments would interleave
+  //      writes that must land after the suspended draws;
+  //  (b) attaching (= writing) an image a suspended draw SAMPLED would make
+  //      that draw read data from its future (the round-robin reuse hazard).
+  static bool passConflictsSuspended(const CmdListState& state,
+      const void* const* images, uint32_t count) {
+    if (state.suspSampledOverflow)
+      return true; // lost track of the sampled set: conservative
+
+    for (uint32_t i = 0; i < count; i++) {
+      for (uint32_t j = 0; j < state.suspAttachCount; j++) {
+        if (images[i] == state.suspAttach[j])
+          return true;
+      }
+      for (const void* s : state.suspSampled) {
+        if (images[i] == s)
+          return true;
+      }
+    }
+    return false;
+  }
+
+  // Resumes appending to the suspended pass: the parked chain becomes live
+  // again and NO encoder is created — that is the whole win. Encoder-scoped
+  // dedupe state is conservatively reset (the interludes advanced it), so
+  // the front-end re-emits binds into the chain; redundant set-commands
+  // within one encoder are cheap and correct.
+  static void resumeSuspendedPass(CmdListState& state) {
+    state.pendingPass = state.suspPass;
+    state.cmdHead     = state.suspHead;
+    state.cmdTail     = state.suspTail;
+    std::memcpy(state.passAttach, state.suspAttach, sizeof(state.passAttach));
+    state.passAttachCount = state.suspAttachCount;
+    state.passSampled.swap(state.suspSampled);
+    state.passSampledOverflow = state.suspSampledOverflow;
+
+    state.suspActive = false;
+    state.suspHead   = nullptr;
+    state.suspTail   = nullptr;
+    state.suspSampled.clear();
+    state.suspSampledOverflow = false;
+    state.suspAttachCount = 0u;
+
+    state.passPending = true;
+    state.kind        = EncoderKind::Render;
+    state.visAttached = false;
+    state.arenaFloor  = 0;
+
+    // conservative fresh-encoder treatment for every encoder-scoped cache
+    state.encoderEpoch++;
+    state.lastRenderPso  = 0;
+    state.lastRenderDsso = 0;
+    state.lastSamplerHeap[0] = -1;
+    state.lastSamplerHeap[1] = -1;
+    state.renderResident.reset();
+
+    if (passDeferStatsEnabled())
+      s_passDeferStats.resumes += 1u;
+  }
+
+  // Lazily opens a render pass: parks the descriptor, resets encoder-scoped
+  // state exactly like an eager begin, creates nothing.
+  static void deferBeginRenderPass(CmdListState& state,
+      const WMTRenderPassInfo& pass,
+      const void* const* images, uint32_t imageCount) {
+    if (state.encoder)
+      endEncoder(state); // close a lingering blit/compute encoder
+
+    state.pendingPass = pass;
+    state.passPending = true;
+    state.kind        = EncoderKind::Render;
+    state.visAttached = false;
+
+    state.passAttachCount =
+      std::min(imageCount, CmdListState::MaxPassAttach);
+    std::memcpy(state.passAttach, images,
+      state.passAttachCount * sizeof(images[0]));
+    state.passSampled.clear();
+    state.passSampledOverflow = false;
+
+    state.encoderEpoch++;
+    state.lastRenderPso  = 0;
+    state.lastRenderDsso = 0;
+    state.lastSamplerHeap[0] = -1;
+    state.lastSamplerHeap[1] = -1;
+    state.renderResident.reset();
+
+    if (passDeferStatsEnabled())
+      s_passDeferStats.deferredBegins += 1u;
+  }
+
+  // Draw-path hook (ab-loop): records what a lazily-open pass samples and
+  // catches the two per-draw hazards. `write` marks storage images — shader
+  // writes escape the attachment set, which voids the reorder proof, so the
+  // pass materializes on the spot and any suspension flushes.
+  static void passDeferNoteSampled(CmdListState& state, const void* image,
+      bool write) {
+    if (write) {
+      flushSuspendedPass(state, PassFlushStorage);
+      if (state.passPending)
+        materializePendingPass(state); // pins this pass's order; never suspends
+      return;
+    }
+
+    // interlude draw sampling a suspended attachment must execute after it
+    if (state.suspActive) {
+      for (uint32_t j = 0; j < state.suspAttachCount; j++) {
+        if (image == state.suspAttach[j]) {
+          flushSuspendedPass(state, PassFlushSampled);
+          break;
+        }
+      }
+    }
+
+    // the sampled set only matters for passes that can still suspend
+    if (!state.passPending || state.passSampledOverflow)
+      return;
+    for (const void* s : state.passSampled) {
+      if (s == image)
+        return;
+    }
+    if (state.passSampled.size() >= CmdListState::MaxSampledTrack) {
+      state.passSampledOverflow = true; // coarser = more flushes = still correct
+      return;
+    }
+    state.passSampled.push_back(image);
   }
 
   static void resetCmdListState(const void* list) {
@@ -388,6 +863,14 @@ namespace dxvk::d9mt {
       state = std::move(entry->second);
       s_cmdListStates.erase(entry);
     }
+
+    // a submitted list flushed everything at commit; a reset-without-commit
+    // list never reaches the GPU, so parked/lazy passes are simply dropped
+    state->suspActive  = false;
+    state->passPending = false;
+    state->cmdHead     = nullptr;
+    state->cmdTail     = nullptr;
+    state->arenaFloor  = 0;
 
     endEncoder(*state);
 
@@ -435,6 +918,8 @@ namespace dxvk::d9mt {
       return state.encoder;
 
     endEncoder(state);
+    // a blit may read or write anything: the suspended pass must encode first
+    flushSuspendedPass(state, PassFlushBlit);
 
     if (!ensureCmdBuf(state))
       return 0;
@@ -457,6 +942,8 @@ namespace dxvk::d9mt {
       return state.encoder;
 
     endEncoder(state);
+    // compute may read or write anything: the suspended pass must encode first
+    flushSuspendedPass(state, PassFlushCompute);
 
     if (!ensureCmdBuf(state))
       return 0;
@@ -494,6 +981,21 @@ namespace dxvk::d9mt {
   // work (clears / discards). Ends any open encoder first. The whole
   // end-old + begin + end-new sequence is ONE fused d9mtmetal crossing.
   static void encodeEmptyRenderPass(CmdListState& state, WMTRenderPassInfo& pass) {
+    // Standalone clears while a pass is suspended: the clear's target could
+    // alias something a suspended draw sampled, and it counts as an interlude
+    // write either way — flush unconditionally, the win case never hits this.
+    // (Also materializes a lazily-open pass: the fused transition below only
+    // knows how to end a REAL encoder.)
+    flushSuspendedPass(state, PassFlushClear);
+    if (state.passPending && state.cmdHead)
+      flushRenderCmds(state); // materializes; encoder then ends fused below
+
+    if (state.passPending) {
+      // empty lazily-open pass: nothing to fuse with — end it (load actions
+      // may still matter), then open the clear pass standalone
+      endEncoder(state);
+    }
+
     if (state.encoder)
       flushRenderCmds(state);
 
@@ -525,9 +1027,16 @@ namespace dxvk::d9mt {
   static obj_handle_t cmdListCommit(const void* list) {
     auto& state = cmdListState(list);
     endEncoder(state);
+    flushSuspendedPass(state, PassFlushSubmit); // nothing outlives the submit
 
     if (state.cmdbuf)
       MTLCommandBuffer_commit(state.cmdbuf);
+
+    if (passDeferEnabled() && passDeferStatsEnabled()) {
+      static uint64_t s_commits = 0u;
+      if ((++s_commits & 31u) == 0u)
+        passDeferLogStats("periodic"); // atexit rewrites with the final tally
+    }
 
     return state.cmdbuf;
   }
@@ -590,6 +1099,14 @@ namespace dxvk::d9mt {
 
   obj_handle_t cmdListBeginRenderPass(const void* list, WMTRenderPassInfo& pass) {
     auto& state = cmdListState(list);
+
+    // Eager begins (presenter, clear-with-draw, resolves) know nothing about
+    // the deferral machinery: settle any lazily-open or suspended pass first
+    // so this pass's encoder lands after both, matching program order.
+    if (unlikely(state.passPending || state.suspActive)) {
+      endEncoder(state);
+      flushSuspendedPass(state, PassFlushExternal);
+    }
 
     // Fused transition: flush pending commands (one winemetal crossing when
     // non-empty), then end-old + begin-new in ONE d9mtmetal crossing —
@@ -667,10 +1184,13 @@ namespace dxvk::d9mt {
   // at the same offsets), making the reinterpret to set ::next valid.
   template<typename T>
   static void encodeRenderCmd(CmdListState& state, const T* cmd) {
-    if (!(state.kind == EncoderKind::Render && state.encoder))
+    if (state.kind != EncoderKind::Render)
+      return;
+    if (!state.encoder && !state.passPending)
       return;
 
     if (!batchRenderCmdsEnabled()) {
+      // passPending is impossible here (deferral requires batching)
       MTLRenderCommandEncoder_encodeCommands(state.encoder,
         reinterpret_cast<const wmtcmd_base*>(cmd));
       return;
@@ -1810,7 +2330,9 @@ namespace dxvk {
   void DxvkCommandList::finalize() {
     // Metal: end any open encoder so the command buffer can be committed.
     // The actual commit happens in DxvkDevice::submitCommandList.
-    d9mt::endEncoder(d9mt::cmdListState(this));
+    auto& state = d9mt::cmdListState(this);
+    d9mt::endEncoder(state);
+    d9mt::flushSuspendedPass(state, d9mt::PassFlushSubmit);
   }
 
 
@@ -2540,6 +3062,10 @@ namespace dxvk {
     auto& state = d9mt::cmdListState(m_cmd.ptr());
     if (state.kind == d9mt::EncoderKind::Render)
       d9mt::endEncoder(state);
+
+    // every non-draw context op routes through here: mandatory flush point
+    // for a suspended pass (copies, readbacks, barriers, events, ...)
+    d9mt::flushSuspendedPass(state, d9mt::PassFlushSpill);
 
     m_flags.clr(DxvkContextFlag::GpRenderPassBound);
   }
@@ -4225,6 +4751,10 @@ namespace dxvk {
     // samples: split it, so the next draw restarts the pass with the buffer
     // attached and the query restarted into a fresh slot.
     auto& cstate = d9mt::cmdListState(m_cmd.ptr());
+    // simplest correct cut for the deferral: ANY query activity flushes a
+    // suspended pass (visibility slots are per-encoder-span; do not let one
+    // span a reordering window)
+    d9mt::flushSuspendedPass(cstate, d9mt::PassFlushQuery);
     if (cstate.kind == d9mt::EncoderKind::Render && !cstate.visAttached)
       this->spillRenderPass(true);
 
@@ -4245,6 +4775,10 @@ namespace dxvk {
     if (dstate.activeOcclusionCount)
       dstate.activeOcclusionCount -= 1u;
 
+    // deferral rule: any query activity flushes a suspended pass
+    d9mt::flushSuspendedPass(d9mt::cmdListState(m_cmd.ptr()),
+      d9mt::PassFlushQuery);
+
     m_queryManager.disableQuery(m_cmd, query);
   }
 
@@ -4255,6 +4789,10 @@ namespace dxvk {
         uint32_t(query->type())));
       return;
     }
+
+    // deferral rule: any query activity flushes a suspended pass
+    d9mt::flushSuspendedPass(d9mt::cmdListState(m_cmd.ptr()),
+      d9mt::PassFlushQuery);
 
     m_queryManager.writeTimestamp(m_cmd, query);
   }
@@ -4561,7 +5099,26 @@ namespace dxvk {
     // end the current pass; pending clears get handled at startRenderPass
     if (cstate.kind == d9mt::EncoderKind::Render) {
       m_queryManager.endQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
-      d9mt::endEncoder(cstate);
+
+      if (d9mt::passDeferEnabled()
+       && cstate.passPending          // lazily open: encoder order still free
+       && !cstate.suspActive          // one suspension slot, on purpose
+       && !cstate.visAttached) {      // never suspend visibility passes
+        if (cstate.cmdArenaUsed <= d9mt::PassDeferSuspendBudget) {
+          // leave the pass SUSPENDED: if the game comes back to the same
+          // attachments, startRenderPass resumes appending with no new
+          // encoder and no restart
+          d9mt::suspendPendingPass(cstate);
+        } else {
+          // chain over budget (the arena must keep interlude headroom):
+          // this is the capacity flush condition
+          if (d9mt::passDeferStatsEnabled())
+            d9mt::s_passDeferStats.capacitySkips += 1u;
+          d9mt::endEncoder(cstate);
+        }
+      } else {
+        d9mt::endEncoder(cstate);
+      }
     }
 
     m_flags.clr(DxvkContextFlag::GpRenderPassBound);
@@ -4729,6 +5286,12 @@ namespace dxvk {
 
     bool valid = true;
 
+    // image-level attachment identities for the deferral hazard checks (the
+    // RTV here and the SRV a draw samples are different Metal views of the
+    // same image, so view handles cannot detect the alias)
+    std::array<const void*, d9mt::CmdListState::MaxPassAttach> attachImages = { };
+    uint32_t attachImageCount = 0u;
+
     for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
       const auto& view = rt.color[i].view;
       if (view == nullptr)
@@ -4740,6 +5303,8 @@ namespace dxvk {
         valid = false;
         continue;
       }
+
+      attachImages[attachImageCount++] = view->image();
 
       auto& att = pass.colors[i];
       att.texture = handle;
@@ -4783,6 +5348,8 @@ namespace dxvk {
         Logger::err("d9mt: startRenderPass: depth attachment has no Metal view");
         valid = false;
       } else {
+        attachImages[attachImageCount++] = view->image();
+
         // unified Depth32Float_Stencil8: always bind BOTH planes
         pass.depth.texture = handle;
         pass.depth.load_action  = WMTLoadActionLoad;
@@ -4815,27 +5382,67 @@ namespace dxvk {
     if (!valid)
       return; // GpRenderPassBound stays clear; the draw is dropped loudly
 
-    obj_handle_t encoder = d9mt::cmdListBeginRenderPass(m_cmd.ptr(), pass);
-    if (!encoder)
-      return;
-
     auto& cstate = d9mt::cmdListState(m_cmd.ptr());
-    cstate.lastRenderPso  = 0;
-    cstate.lastRenderDsso = 0;
-    cstate.lastSamplerHeap[0] = -1;
-    cstate.lastSamplerHeap[1] = -1;
-    cstate.renderResident.reset();
-    // (lastVertexBind self-invalidates on encoderEpoch — see
-    // updateVertexBufferBindings)
+    const bool deferOn = d9mt::passDeferEnabled();
+    bool resumed = false;
 
-    // restart active occlusion queries into a fresh visibility slot of the
-    // new encoder (queries span pass splits by accumulating GPU queries)
-    cstate.visAttached = pass.visibility_buffer != 0;
-    m_queryManager.beginQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
+    if (deferOn && cstate.suspActive) {
+      if (d9mt::passResumesSuspended(cstate, pass)) {
+        // back on the suspended pass's attachments: keep appending to the
+        // parked chain — no encoder, no restart
+        d9mt::resumeSuspendedPass(cstate);
+        resumed = true;
+      } else if (d9mt::passConflictsSuspended(cstate,
+          attachImages.data(), attachImageCount)) {
+        // this pass writes something the suspended pass's ordering depends
+        // on: encode the suspended pass NOW, before this pass's encoder
+        // exists (attach = shared attachment; hazard = round-robin reuse of
+        // a sampled render target)
+        bool attach = false;
+        for (uint32_t i = 0; i < attachImageCount && !attach; i++)
+          for (uint32_t j = 0; j < cstate.suspAttachCount && !attach; j++)
+            attach = attachImages[i] == cstate.suspAttach[j];
+        d9mt::flushSuspendedPass(cstate,
+          attach ? d9mt::PassFlushAttach : d9mt::PassFlushHazard);
+      }
+      // else: a disjoint interlude pass — the suspension stays parked
+    }
+
+    if (!resumed) {
+      if (deferOn && !pass.visibility_buffer) {
+        // lazy begin: descriptor parked, encoder created when the pass ends
+        d9mt::deferBeginRenderPass(cstate, pass,
+          attachImages.data(), attachImageCount);
+      } else {
+        // eager begin: visibility-result buffers attach at encoder creation
+        // and their slots are per-encoder-span, so query passes never defer
+        obj_handle_t encoder = d9mt::cmdListBeginRenderPass(m_cmd.ptr(), pass);
+        if (!encoder)
+          return;
+
+        cstate.lastRenderPso  = 0;
+        cstate.lastRenderDsso = 0;
+        cstate.lastSamplerHeap[0] = -1;
+        cstate.lastSamplerHeap[1] = -1;
+        cstate.renderResident.reset();
+        // (lastVertexBind self-invalidates on encoderEpoch — see
+        // updateVertexBufferBindings)
+
+        cstate.visAttached = pass.visibility_buffer != 0;
+      }
+
+      // restart active occlusion queries into a fresh visibility slot of the
+      // new encoder (queries span pass splits by accumulating GPU queries);
+      // no-op for deferred begins — active queries force the eager path
+      m_queryManager.beginQueries(m_cmd, VK_QUERY_TYPE_OCCLUSION);
+    }
 
     m_flags.set(DxvkContextFlag::GpRenderPassBound);
 
-    // encoder state is fresh: re-emit everything encoder-scoped
+    // encoder state is fresh: re-emit everything encoder-scoped. On RESUME
+    // the chain continues into the same future encoder, but the interludes
+    // may have consumed these flags with THEIR values — re-emitting is the
+    // conservative correct choice (redundant set-commands are cheap).
     m_flags.set(
       DxvkContextFlag::GpDirtyViewport,
       DxvkContextFlag::GpDirtyRasterizerState,
@@ -4850,8 +5457,10 @@ namespace dxvk {
 
     m_descriptorState.dirtyStages(VK_SHADER_STAGE_ALL_GRAPHICS);
 
-    m_renderPassIndex += 1u;
-    m_cmd->addStatCtr(DxvkStatCounter::CmdRenderPassCount, 1u);
+    if (!resumed) {
+      m_renderPassIndex += 1u;
+      m_cmd->addStatCtr(DxvkStatCounter::CmdRenderPassCount, 1u);
+    }
   }
 
 
@@ -4997,7 +5606,8 @@ namespace dxvk {
 
     // The shadow only describes the CURRENT render encoder: a fresh encoder
     // starts with no buffers bound, so drop it whenever the epoch moves.
-    // (One bump site — cmdListBeginRenderPass — so this cannot miss one.)
+    // (Bump sites: cmdListBeginRenderPass, deferBeginRenderPass and
+    // resumeSuspendedPass — every path that opens or re-enters a pass.)
     if (cstate.vertexBindEpoch != cstate.encoderEpoch) {
       std::memset(cstate.lastVertexBind, 0, sizeof(cstate.lastVertexBind));
       cstate.vertexBindEpoch = cstate.encoderEpoch;
@@ -5406,6 +6016,13 @@ namespace dxvk {
               m_cmd->track(view->image(),
                 ref.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                   ? DxvkAccess::Write : DxvkAccess::Read);
+
+              // deferral hazards: what a lazily-open pass samples, and
+              // interlude draws touching the suspended pass's attachments
+              // (both fields stay false with D9MT_PASS_DEFER off)
+              if (unlikely(cstate.passPending || cstate.suspActive))
+                d9mt::passDeferNoteSampled(cstate, view->image(),
+                  ref.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
             } break;
 
             default: {

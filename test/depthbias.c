@@ -5,16 +5,42 @@
  * textures re-draw terrain with a small negative constant bias; if the
  * bias arrives ~2^23 too small they z-fight (decals clip into terrain).
  *
- * Fixed-function XYZRHW quads, no shader blobs (verifytri pattern):
- *   1. green quad at z=0.5                      (base layer)
+ * Three independent bands, fixed-function XYZRHW quads, no shader blobs
+ * (verifytri pattern):
+ *
+ * Band A (top third) — the original coarse-bias trio:
+ *   1. green quad at z=0.5                       (base layer)
  *   2. red   quad at z=0.5+2e-6, DEPTHBIAS=-5e-4 -> wins under D3D9
  *      semantics (0.500002 - 0.0005 < 0.5), loses if the bias is nulled
  *   3. blue  quad at z=0.6, bias reset to 0      -> must lose (sanity:
  *      proves the depth test itself works, so a broken depth test can't
  *      masquerade as a pass)
- * Center pixel red => PASS; green => FAIL (bias ignored/underscaled);
- * blue or anything else => BROKEN depth test.
- * Results go to depthbias_out.txt; PASS/FAIL also on stdout. Self-exits. */
+ *
+ * Band B (middle third) — MARGINAL constant bias at z=0.9. The Metal depth
+ *   buffer is Depth32Float, whose least-representable bias unit is
+ *   r = 2^(e-23) with e the exponent of the primitive's z — for the
+ *   z in [0.5,1) that WoW terrain actually occupies, r = 2^-24. A constant
+ *   pre-scale of 2^23 therefore delivers HALF the game-requested offset
+ *   (and less as z shrinks below 0.5) — enough for band A's 25x-margin
+ *   bias, but z-fighting territory for a game-scale marginal bias on a
+ *   slope. This band is sized so that the full offset wins and a halved
+ *   offset loses:
+ *   4. green base at z=0.9
+ *   5. red decal at z=0.9+2.25e-5, DEPTHBIAS=-3e-5:
+ *        full  offset: 0.9000225 - 3.0e-5 = 0.8999925 < 0.9 -> red
+ *        half  offset: 0.9000225 - 1.5e-5 = 0.9000075 > 0.9 -> green (FAIL)
+ *
+ * Band C (bottom third) — slope-scale pass-through (regression guard; the
+ *   slope term is unitless in both APIs and must NOT get the constant
+ *   term's format scale):
+ *   6. green sloped base, z = 0.5 + 0.2*(x/W)  (dz/dx = 0.2/W per pixel)
+ *   7. red   quad, same slope, z shifted +1e-4, SLOPESCALEDEPTHBIAS=-0.5:
+ *        slope bias = -0.5 * 7.8125e-4 = -3.90625e-4; +1e-4 - 3.9e-4 < 0
+ *        -> red wins iff the slope term is applied unscaled
+ *
+ * Probe pixels: (W/2, H/6), (W/2, H/2), (W/2, 5H/6). All three bands must
+ * land their expected color for PASS. Results go to depthbias_out.txt;
+ * PASS/FAIL also on stdout. Self-exits. */
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
@@ -53,18 +79,37 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
   return DefWindowProcA(h, m, w, l);
 }
 
-/* full-target quad at constant depth */
-static void quad(struct Vertex v[6], float W, float H, float z, DWORD color) {
-  const struct Vertex tl = {0.0f, 0.0f, z, 1.0f, color};
-  const struct Vertex tr = {W, 0.0f, z, 1.0f, color};
-  const struct Vertex bl = {0.0f, H, z, 1.0f, color};
-  const struct Vertex br = {W, H, z, 1.0f, color};
+/* banded quad at constant depth */
+static void quad(struct Vertex v[6], float x0, float y0, float x1, float y1,
+                 float z, DWORD color) {
+  const struct Vertex tl = {x0, y0, z, 1.0f, color};
+  const struct Vertex tr = {x1, y0, z, 1.0f, color};
+  const struct Vertex bl = {x0, y1, z, 1.0f, color};
+  const struct Vertex br = {x1, y1, z, 1.0f, color};
   v[0] = tl; v[1] = tr; v[2] = bl;
   v[3] = bl; v[4] = tr; v[5] = br;
 }
 
+/* banded quad with z varying linearly in x: z(x0)=z0, z(x1)=z1 */
+static void slopeQuad(struct Vertex v[6], float x0, float y0, float x1,
+                      float y1, float z0, float z1, DWORD color) {
+  const struct Vertex tl = {x0, y0, z0, 1.0f, color};
+  const struct Vertex tr = {x1, y0, z1, 1.0f, color};
+  const struct Vertex bl = {x0, y1, z0, 1.0f, color};
+  const struct Vertex br = {x1, y1, z1, 1.0f, color};
+  v[0] = tl; v[1] = tr; v[2] = bl;
+  v[3] = bl; v[4] = tr; v[5] = br;
+}
+
+static DWORD floatBits(float f) {
+  DWORD d;
+  memcpy(&d, &f, 4);
+  return d;
+}
+
 int main(void) {
-  const UINT W = 256, H = 256;
+  const UINT W = 256, H = 258; /* 3 x 86-pixel bands */
+  const float bandH = 86.0f;
 
   g_out = fopen("depthbias_out.txt", "w");
   if (!g_out)
@@ -115,15 +160,14 @@ int main(void) {
   CHECK(IDirect3DDevice9_CreateOffscreenPlainSurface(
       dev, W, H, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sysmem, NULL));
 
-  const float biasNeg = -0.0005f; /* D3D9: raw z offset, wins over +2e-6 */
-  const float biasZero = 0.0f;
-  DWORD biasNegBits, biasZeroBits;
-  memcpy(&biasNegBits, &biasNeg, 4);
-  memcpy(&biasZeroBits, &biasZero, 4);
+  const DWORD biasZero = floatBits(0.0f);
+  const DWORD biasCoarse = floatBits(-0.0005f);  /* band A: 25x margin */
+  const DWORD biasMarginal = floatBits(-3e-5f);  /* band B: 1.33x margin */
+  const DWORD slopeHalfNeg = floatBits(-0.5f);   /* band C */
 
   struct Vertex v[6];
   int frames = 0, verified = 0, ok = 0;
-  DWORD prevRgb = 0xFFFFFFFF; /* impossible XRGB value: no match on frame 1 */
+  DWORD prev[3] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
   MSG msg;
   for (;;) {
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -139,23 +183,48 @@ int main(void) {
     CHECK(IDirect3DDevice9_BeginScene(dev));
     CHECK(IDirect3DDevice9_SetFVF(dev, FVF_QUAD));
 
-    /* 1: green base layer at z=0.5 */
-    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZeroBits));
-    quad(v, (float)W, (float)H, 0.5f, 0xFF00FF00);
+    /* ---- band A: y in [0, 86) — coarse-bias trio ---- */
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+    quad(v, 0.0f, 0.0f, (float)W, bandH, 0.5f, 0xFF00FF00);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
 
-    /* 2: red decal slightly BEHIND, pulled in front by the constant bias */
-    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasNegBits));
-    quad(v, (float)W, (float)H, 0.500002f, 0xFFFF0000);
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasCoarse));
+    quad(v, 0.0f, 0.0f, (float)W, bandH, 0.500002f, 0xFFFF0000);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
 
-    /* 3: blue sanity quad clearly behind, bias reset — must stay hidden */
-    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZeroBits));
-    quad(v, (float)W, (float)H, 0.6f, 0xFF0000FF);
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+    quad(v, 0.0f, 0.0f, (float)W, bandH, 0.6f, 0xFF0000FF);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
+
+    /* ---- band B: y in [86, 172) — marginal bias at z=0.9 ---- */
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+    quad(v, 0.0f, bandH, (float)W, 2.0f * bandH, 0.9f, 0xFF00FF00);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasMarginal));
+    quad(v, 0.0f, bandH, (float)W, 2.0f * bandH, 0.9000225f, 0xFFFF0000);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+
+    /* ---- band C: y in [172, 258) — slope-scale pass-through ---- */
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+    slopeQuad(v, 0.0f, 2.0f * bandH, (float)W, 3.0f * bandH, 0.5f, 0.7f,
+              0xFF00FF00);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_SLOPESCALEDEPTHBIAS,
+                                          slopeHalfNeg));
+    slopeQuad(v, 0.0f, 2.0f * bandH, (float)W, 3.0f * bandH, 0.5001f, 0.7001f,
+              0xFFFF0000);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_SLOPESCALEDEPTHBIAS,
+                                          biasZero));
 
     CHECK(IDirect3DDevice9_EndScene(dev));
 
@@ -172,37 +241,56 @@ int main(void) {
 
       D3DLOCKED_RECT lr;
       CHECK(IDirect3DSurface9_LockRect(sysmem, &lr, NULL, D3DLOCK_READONLY));
-      const DWORD px =
-          *(const DWORD *)((const BYTE *)lr.pBits + (H / 2) * lr.Pitch +
-                           (W / 2) * 4);
+      const UINT probeY[3] = {43, 129, 215}; /* band centers */
+      DWORD rgb[3];
+      int i;
+      for (i = 0; i < 3; i++)
+        rgb[i] = (*(const DWORD *)((const BYTE *)lr.pBits +
+                                   probeY[i] * lr.Pitch + (W / 2) * 4)) &
+                 0x00FFFFFF;
       IDirect3DSurface9_UnlockRect(sysmem);
 
-      const DWORD rgb = px & 0x00FFFFFF;
-      /* Latch only after TWO consecutive frames agree: all three quads
-       * share one PSO, and the async compile can flip it hot between two
-       * draws of a single frame — that transition frame can show any
-       * subset of the layers (e.g. red-on-clear = false PASS, or
-       * blue-only = false BROKEN). The frame after the flip has every
+      /* Latch only after TWO consecutive frames agree on the full tuple:
+       * the quads share PSOs and the async compile can flip one hot
+       * between two draws of a single frame — that transition frame can
+       * show any subset of the layers. The frame after the flip has every
        * draw live, so agreement across two frames screens the race out. */
-      if (rgb != 0x00101010 && rgb == prevRgb) { /* stable — classify */
+      const int anyDrawn = rgb[0] != 0x00101010 || rgb[1] != 0x00101010 ||
+                           rgb[2] != 0x00101010;
+      const int stable = rgb[0] == prev[0] && rgb[1] == prev[1] &&
+                         rgb[2] == prev[2];
+      if (anyDrawn && stable) {
         verified = 1;
-        LOG("center pixel: 0x%08lx (frame %d)", (unsigned long)px, frames);
-        if (rgb == 0x00FF0000) {
+        LOG("probes: A=0x%06lx B=0x%06lx C=0x%06lx (frame %d)",
+            (unsigned long)rgb[0], (unsigned long)rgb[1],
+            (unsigned long)rgb[2], frames);
+        int passA = rgb[0] == 0x00FF0000;
+        int passB = rgb[1] == 0x00FF0000;
+        int passC = rgb[2] == 0x00FF0000;
+        LOG("%s: band A coarse constant bias (25x margin) %s", passA ? "ok" : "FAIL",
+            passA ? "applied" : (rgb[0] == 0x0000FF00 ? "(decal lost to base layer)"
+                                                      : "(BROKEN depth test)"));
+        LOG("%s: band B marginal constant bias at z=0.9 (needs full 2^24 "
+            "float-depth scale) %s", passB ? "ok" : "FAIL",
+            passB ? "applied" : (rgb[1] == 0x0000FF00 ? "(underscaled: half-offset regime)"
+                                                      : "(BROKEN depth test)"));
+        LOG("%s: band C slope-scale bias pass-through %s", passC ? "ok" : "FAIL",
+            passC ? "applied" : (rgb[2] == 0x0000FF00 ? "(slope term lost)"
+                                                      : "(BROKEN depth test)"));
+        if (passA && passB && passC) {
           LOG("PASS: DEPTHBIAS applied with D3D9 raw-offset semantics");
           ok = 1;
-        } else if (rgb == 0x0000FF00) {
-          LOG("FAIL: DEPTHBIAS ignored or underscaled (decal lost to base "
-              "layer)");
         } else {
-          LOG("FAIL: BROKEN depth test (expected red or green, got 0x%06lx)",
-              (unsigned long)rgb);
+          LOG("FAIL: depth bias semantics diverge from D3D9 (see bands above)");
         }
       } else if (frames >= 600) {
         verified = 1;
         LOG("FAIL: no stable frame in %d frames (pipeline never ready?)",
             frames);
       } else {
-        prevRgb = rgb;
+        prev[0] = rgb[0];
+        prev[1] = rgb[1];
+        prev[2] = rgb[2];
       }
     }
 

@@ -813,25 +813,38 @@ namespace dxvk {
 
     features.extDepthClipEnable.depthClipEnable = VK_TRUE;
 
-    // extDepthBiasControl must NOT be advertised: floatRepresentation
-    // promises the front-end that the depth bias constant is added to z as
-    // a raw float (D3D9 semantics), but the backend hands it verbatim to
+    // extDepthBiasControl: advertise ONLY the force-unorm representation.
+    // floatRepresentation must stay off — it promises the front-end that
+    // the depth bias constant is added to z as a raw float (D3D9
+    // semantics), but the backend hands it verbatim to
     // MTLRenderCommandEncoder setDepthBias, whose constant is in units of
-    // the least representable depth value (bias * r, r ~= 2^-23 for the
-    // float depth buffers we map D24S8 to). A raw D3D9 bias (order 1e-4)
-    // becomes ~1e-4 * 2^-23 ~= 0 — projected/decal geometry z-fights the
-    // base pass (WoW ground textures clip into terrain). Left unadvertised,
-    // the front-end takes its stock fallback (same as d9vk on MoltenVK):
-    // LEAST_REPRESENTABLE_VALUE representation, bias pre-scaled by
-    // GetDepthBufferRValue (2^23 for D32) — which matches Metal's units.
+    // the least representable depth value. A raw D3D9 bias (order 1e-4)
+    // would become ~1e-4 * r ~= 0 — projected/decal geometry z-fights the
+    // base pass (WoW ground textures clip into terrain).
+    //
+    // For the Depth32Float buffers every D3D9 depth format maps to, Metal's
+    // unit r is NOT the constant 2^-23 the stock LEAST_REPRESENTABLE
+    // fallback assumes: measured on Apple GPUs (test/depthbias.c band B) it
+    // is the float-depth rule r = 2^(e-23), e = exponent of the primitive's
+    // z. WoW terrain sits at window z in [0.5,1) where e = -1, so the
+    // fallback's 2^23 pre-scale delivered HALF the game-requested offset —
+    // marginal decals (selection circles on uneven terrain) clipped as the
+    // camera moved z across the octave. Advertising
+    // leastRepresentableValueForceUnormRepresentation makes the front-end
+    // pre-scale by GetDepthBufferRValue(forceUnorm) = 2^24, which lands the
+    // exact D3D9 offset for z in [0.5,1) (raw * 2^24 * 2^-24), degrades to
+    // half only below z=0.25 octaves, and over-biases (2x, harmless) only
+    // at the far plane itself. The backend stores the representation enum
+    // and ignores it — Metal has no equivalent switch to flip.
     // Known residual: D16 surfaces get rValue 2^16 (the format the
-    // front-end believes it uses) while the Metal buffer is Depth32Float
-    // (r ~= 2^-23), leaving the constant bias ~2^7 too small on D16 —
-    // pre-existing, and moot for the D24S8 path WoW uses.
-    // Regression test: test/depthbias.c.
-    features.extDepthBiasControl.depthBiasControl = VK_FALSE;
+    // front-end believes it uses) while the Metal buffer is Depth32Float,
+    // leaving the constant bias ~2^7 too small on D16 — pre-existing, and
+    // moot for the D24S8 path WoW uses.
+    // Regression test: test/depthbias.c (bands A/B/C).
+    features.extDepthBiasControl.depthBiasControl = VK_TRUE;
     features.extDepthBiasControl.depthBiasExact   = VK_FALSE;
     features.extDepthBiasControl.floatRepresentation = VK_FALSE;
+    features.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
 
     features.extRobustness2.robustBufferAccess2 = VK_TRUE;
     features.extRobustness2.nullDescriptor      = VK_TRUE;

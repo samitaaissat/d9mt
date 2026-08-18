@@ -5312,11 +5312,12 @@ namespace dxvk {
       }
     }
 
-    // ---- ONE ring allocation + ONE track() per invocation. The AB and push
-    // sections of every dirty stage are carved (256-aligned, matching the
-    // ring's own alignment) out of a single slice: 3-4 alloc/slice/track
-    // round-trips per draw collapse into one — Rc refcount traffic and
-    // tracker appends are a measured chunk of per-draw CPU under Rosetta.
+    // ---- ONE ring allocation per invocation. The AB and push sections of
+    // every dirty stage are carved (256-aligned, matching the ring's own
+    // alignment) out of a single POD slice: 3-4 alloc/slice/track round-trips
+    // per draw collapse into one allocation with ZERO Rc traffic — refcount
+    // atomics are a measured chunk of per-draw CPU under Rosetta. Lifetime
+    // moved into allocPod (one track per ring chunk, not per allocation).
     VkDeviceSize secOff[4] = { };
     VkDeviceSize packedSize = 0u;
     for (uint32_t stage = 0; stage < 2u; stage++) {
@@ -5331,19 +5332,16 @@ namespace dxvk {
       packedSize += dxvk::align(pushBytes, 256u);
     }
 
-    DxvkBufferSlice packedSlice;
-    DxvkResourceBufferInfo packedInfo = { };
+    StagingSlicePod packed;
     uint8_t* packedPtr = nullptr;
     if (packedSize) {
       D9MT_MICRO_BEG(tPackAlloc);
-      packedSlice = dstate.ring->alloc(packedSize);
-      packedPtr = reinterpret_cast<uint8_t*>(packedSlice.mapPtr(0));
+      packed = dstate.ring->allocPod(packedSize, m_cmd.ptr());
+      packedPtr = reinterpret_cast<uint8_t*>(packed.mapPtr);
       if (!packedPtr) {
         Logger::err("d9mt: shader-resource staging allocation failed");
         return false;
       }
-      packedInfo = packedSlice.getSliceInfo();
-      m_cmd->track(packedSlice.buffer(), DxvkAccess::Read);
       D9MT_MICRO_END(12, tPackAlloc);
     }
 
@@ -5426,8 +5424,8 @@ namespace dxvk {
         D9MT_MICRO_BEG(tAbEnc);
         wmtcmd_render_setbuffer cmd = { };
         cmd.type = setBufferType;
-        cmd.buffer = obj_handle_t(packedInfo.buffer);
-        cmd.offset = packedInfo.offset + secOff[2u * stage + 0u];
+        cmd.buffer = obj_handle_t(packed.buffer);
+        cmd.offset = packed.offset + secOff[2u * stage + 0u];
         cmd.index = uint8_t(shader->abBufferIndex);
         d9mt::encodeRenderCmd(cstate, &cmd);
         D9MT_MICRO_END(14, tAbEnc);
@@ -5445,8 +5443,8 @@ namespace dxvk {
 
         wmtcmd_render_setbuffer cmd = { };
         cmd.type = setBufferType;
-        cmd.buffer = obj_handle_t(packedInfo.buffer);
-        cmd.offset = packedInfo.offset + secOff[2u * stage + 1u];
+        cmd.buffer = obj_handle_t(packed.buffer);
+        cmd.offset = packed.offset + secOff[2u * stage + 1u];
         cmd.index = uint8_t(shader->pushBufferIndex);
         d9mt::encodeRenderCmd(cstate, &cmd);
 
@@ -5647,10 +5645,10 @@ namespace dxvk {
           continue;
 
         uint32_t triCount = draw.vertexCount - 2u;
-        DxvkBufferSlice slice = dstate.ring->alloc(
-          VkDeviceSize(triCount) * 3u * sizeof(uint32_t));
+        StagingSlicePod slice = dstate.ring->allocPod(
+          VkDeviceSize(triCount) * 3u * sizeof(uint32_t), m_cmd.ptr());
 
-        uint32_t* indices = reinterpret_cast<uint32_t*>(slice.mapPtr(0));
+        uint32_t* indices = reinterpret_cast<uint32_t*>(slice.mapPtr);
         if (!indices)
           continue;
 
@@ -5660,21 +5658,17 @@ namespace dxvk {
           indices[3u * t + 2u] = t + 2u;
         }
 
-        auto info = slice.getSliceInfo();
-
         wmtcmd_render_draw_indexed cmd = { };
         cmd.type = WMTRenderCommandDrawIndexed;
         cmd.primitive_type = WMTPrimitiveTypeTriangle;
         cmd.index_type = WMTIndexTypeUInt32;
         cmd.index_count = uint64_t(triCount) * 3u;
-        cmd.index_buffer = obj_handle_t(info.buffer);
-        cmd.index_buffer_offset = info.offset;
+        cmd.index_buffer = obj_handle_t(slice.buffer);
+        cmd.index_buffer_offset = slice.offset;
         cmd.instance_count = draw.instanceCount;
         cmd.base_vertex = int32_t(draw.firstVertex);
         cmd.base_instance = draw.firstInstance;
         d9mt::encodeRenderCmd(cstate, &cmd);
-
-        m_cmd->track(slice.buffer(), DxvkAccess::Read);
         continue;
       }
 
@@ -5751,10 +5745,10 @@ namespace dxvk {
         }
 
         uint32_t triCount = draw.indexCount - 2u;
-        DxvkBufferSlice slice = dstate.ring->alloc(
-          VkDeviceSize(triCount) * 3u * sizeof(uint32_t));
+        StagingSlicePod slice = dstate.ring->allocPod(
+          VkDeviceSize(triCount) * 3u * sizeof(uint32_t), m_cmd.ptr());
 
-        uint32_t* indices = reinterpret_cast<uint32_t*>(slice.mapPtr(0));
+        uint32_t* indices = reinterpret_cast<uint32_t*>(slice.mapPtr);
         if (!indices)
           continue;
 
@@ -5770,21 +5764,17 @@ namespace dxvk {
           indices[3u * t + 2u] = fetch(t + 2u);
         }
 
-        auto info = slice.getSliceInfo();
-
         wmtcmd_render_draw_indexed cmd = { };
         cmd.type = WMTRenderCommandDrawIndexed;
         cmd.primitive_type = WMTPrimitiveTypeTriangle;
         cmd.index_type = WMTIndexTypeUInt32;
         cmd.index_count = uint64_t(triCount) * 3u;
-        cmd.index_buffer = obj_handle_t(info.buffer);
-        cmd.index_buffer_offset = info.offset;
+        cmd.index_buffer = obj_handle_t(slice.buffer);
+        cmd.index_buffer_offset = slice.offset;
         cmd.instance_count = draw.instanceCount;
         cmd.base_vertex = draw.vertexOffset;
         cmd.base_instance = draw.firstInstance;
         d9mt::encodeRenderCmd(cstate, &cmd);
-
-        m_cmd->track(slice.buffer(), DxvkAccess::Read);
         continue;
       }
 

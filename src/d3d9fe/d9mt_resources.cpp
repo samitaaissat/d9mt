@@ -32,6 +32,7 @@
 #include "d9mt_hud.h"
 
 #include "../../vendor/dxvk/src/dxvk/dxvk_buffer.h"
+#include "../../vendor/dxvk/src/dxvk/dxvk_cmdlist.h"
 #include "../../vendor/dxvk/src/dxvk/dxvk_device.h"
 #include "../../vendor/dxvk/src/dxvk/dxvk_image.h"
 #include "../../vendor/dxvk/src/dxvk/dxvk_staging.h"
@@ -1858,6 +1859,75 @@ namespace dxvk {
     DxvkBufferSlice slice(m_buffer, m_offset, size);
     m_offset += alignedSize;
     return slice;
+  }
+
+
+  StagingSlicePod DxvkStagingBuffer::allocPod(VkDeviceSize size, DxvkCommandList* cmdList) {
+    // Allocation behavior mirrors alloc() above byte for byte (same alignment,
+    // same rollover, same oversize escape) — only the return shape and the
+    // ownership plumbing differ. alloc() stays untouched because the vendored
+    // d3d9 front-end still uses it.
+    DxvkBufferCreateInfo info;
+    info.size   = size;
+    info.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
+                | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    info.access = VK_ACCESS_TRANSFER_READ_BIT
+                | VK_ACCESS_SHADER_READ_BIT;
+    info.debugName = "Staging buffer";
+
+    VkDeviceSize alignedSize = dxvk::align(size, 256u);
+    m_allocationCounter += alignedSize;
+
+    if (2 * alignedSize > m_size) {
+      // Oversize escape: a dedicated buffer whose ONLY owner is the command
+      // list's object tracker — the same lifetime the DxvkBufferSlice path
+      // ends up with after the caller's track(), minus the slice round-trip.
+      Rc<DxvkBuffer> buffer = m_device->createBuffer(info,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+      auto sliceInfo = buffer->getSliceInfo();
+
+      StagingSlicePod pod;
+      pod.buffer = sliceInfo.buffer;
+      pod.offset = sliceInfo.offset;
+      pod.mapPtr = sliceInfo.mapPtr;
+
+      cmdList->track(std::move(buffer), DxvkAccess::Read);
+      return pod;
+    }
+
+    if (m_offset + alignedSize > m_size || m_buffer == nullptr) {
+      info.size = m_size;
+
+      // Free resources first if possible, in some rare
+      // situations this may help avoid a memory allocation.
+      m_buffer = nullptr;
+      m_buffer = m_device->createBuffer(info,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      m_offset = 0;
+    }
+
+    // One tracker append per (chunk, command-list incarnation): trackId()
+    // rejects repeats within the same incarnation with a single compare, and
+    // a chunk surviving into the NEXT command list gets re-appended there
+    // because the tracking id advances. That is exactly the "alive until the
+    // GPU finished every command list that touched it" guarantee the
+    // per-allocation track(slice.buffer()) calls provided.
+    cmdList->track(m_buffer, DxvkAccess::Read);
+
+    auto sliceInfo = m_buffer->getSliceInfo(m_offset, size);
+
+    StagingSlicePod pod;
+    pod.buffer = sliceInfo.buffer;
+    pod.offset = sliceInfo.offset;
+    pod.mapPtr = sliceInfo.mapPtr;
+
+    m_offset += alignedSize;
+    return pod;
   }
 
 

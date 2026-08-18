@@ -7,6 +7,27 @@
 
 namespace dxvk {
 
+  class DxvkCommandList;
+
+  /**
+   * \brief POD staging slice
+   *
+   * Result of \ref DxvkStagingBuffer::allocPod. Carries only what the
+   * consumers bind and write through: no \c Rc, so returning one costs no
+   * atomic refcount traffic — the point of the POD path (V2_ARCHITECTURE
+   * §7 phase 1). Lifetime is NOT carried by this struct; allocPod tracks
+   * the backing buffer into the command list instead.
+   */
+  struct StagingSlicePod {
+    /// Backing buffer handle
+    VkBuffer buffer = VK_NULL_HANDLE;
+    /// Byte offset of the slice within the buffer
+    VkDeviceSize offset = 0u;
+    /// Host pointer to the start of the slice
+    void* mapPtr = nullptr;
+  };
+
+
   /**
    * \brief Staging buffer statistics
    *
@@ -55,6 +76,23 @@ namespace dxvk {
      * \returns Allocated slice
      */
     DxvkBufferSlice alloc(VkDeviceSize size);
+
+    /**
+     * \brief Allocates staging buffer memory, POD result
+     *
+     * Same allocation behavior as \ref alloc, but returns a
+     * \ref StagingSlicePod instead of a \c DxvkBufferSlice, so the hot
+     * per-draw callers pay no Rc copy/destroy pair per allocation.
+     * Lifetime is preserved by tracking the backing buffer into
+     * \c cmdList here: DxvkCommandList::track dedupes via trackId, so
+     * each chunk is appended once per command-list incarnation (exactly
+     * the guarantee the per-slice track() calls used to provide, at one
+     * compare instead of an Rc round-trip per allocation).
+     * \param [in] size Number of bytes to allocate
+     * \param [in] cmdList Command list that will consume the slice
+     * \returns Allocated slice, POD
+     */
+    StagingSlicePod allocPod(VkDeviceSize size, DxvkCommandList* cmdList);
 
     /**
      * \brief Resets staging buffer and allocator

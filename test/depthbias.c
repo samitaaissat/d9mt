@@ -1,46 +1,40 @@
-/* depthbias: proves D3DRS_DEPTHBIAS carries D3D9 semantics — a raw offset
- * added to the fragment z (order 1e-4 in normalized depth), NOT the
- * Vulkan/Metal "least representable value" units the backend's
- * MTLRenderCommandEncoder setDepthBias expects. WoW's projected ground
- * textures re-draw terrain with a small negative constant bias; if the
- * bias arrives ~2^23 too small they z-fight (decals clip into terrain).
+/* depthbias: pins down d9mt's depth-bias semantics on Apple float-depth.
  *
- * Three independent bands, fixed-function XYZRHW quads, no shader blobs
- * (verifytri pattern):
+ * Ground truth this test encodes (verified on-device 2026-08-18, and
+ * matching the Vulkan float-depth spec): Metal applies the setDepthBias
+ * constant in units r = 2^(e-23), where e is the exponent of the
+ * primitive's z. The front-end pre-scales the raw D3D9 bias by 2^23
+ * (stock DXVK fallback), so the EFFECTIVE window-z offset is raw * 2^e:
+ * raw/2 for z in [0.5,1), raw/4 in [0.25,0.5), and so on. That octave
+ * dependence is inherent to float depth — a constant pre-scale cannot
+ * remove it (force-unorm advertisement just moves the correct octave and
+ * violates the representation's constancy promise; band D history).
  *
- * Band A (top third) — the original coarse-bias trio:
- *   1. green quad at z=0.5                       (base layer)
- *   2. red   quad at z=0.5+2e-6, DEPTHBIAS=-5e-4 -> wins under D3D9
- *      semantics (0.500002 - 0.0005 < 0.5), loses if the bias is nulled
- *   3. blue  quad at z=0.6, bias reset to 0      -> must lose (sanity:
- *      proves the depth test itself works, so a broken depth test can't
- *      masquerade as a pass)
+ * WoW itself never sets DEPTHBIAS in gameplay (client disassembly:
+ * PolygonOffset written as 0.0 everywhere reachable). Its ground decals
+ * (selection circles, blob shadows) re-draw receiver geometry with
+ * additive blending, depth writes OFF and bias 0 under LESSEQUAL,
+ * relying on cross-pass z invariance that a translation layer cannot
+ * guarantee. The load-bearing fix (mirrored from mtld3d) is the
+ * IMPLICIT DECAL BIAS: draws with depth-test on, z-write off, blending
+ * on and zero app bias get setDepthBias(-1e-4 * 2^23, slope -1.5).
  *
- * Band B (middle third) — MARGINAL constant bias at z=0.9. The Metal depth
- *   buffer is Depth32Float, whose least-representable bias unit is
- *   r = 2^(e-23) with e the exponent of the primitive's z — for the
- *   z in [0.5,1) that WoW terrain actually occupies, r = 2^-24. A constant
- *   pre-scale of 2^23 therefore delivers HALF the game-requested offset
- *   (and less as z shrinks below 0.5) — enough for band A's 25x-margin
- *   bias, but z-fighting territory for a game-scale marginal bias on a
- *   slope. This band is sized so that the full offset wins and a halved
- *   offset loses:
- *   4. green base at z=0.9
- *   5. red decal at z=0.9+2.25e-5, DEPTHBIAS=-3e-5:
- *        full  offset: 0.9000225 - 3.0e-5 = 0.8999925 < 0.9 -> red
- *        half  offset: 0.9000225 - 1.5e-5 = 0.9000075 > 0.9 -> green (FAIL)
+ * Six bands, fixed-function XYZRHW quads, no shader blobs:
+ *   A  coarse explicit bias   z=0.5  raw -5e-4 (eff -2.5e-4) vs sep 2e-6
+ *      + blue z=0.6 sanity layer                            -> RED
+ *   B  marginal explicit bias z=0.9  raw -3e-5 (eff -1.5e-5) vs sep 1e-5
+ *      (1.5x margin inside the [0.5,1) octave)              -> RED
+ *   C  slope-scale pass-through on sloped quads (unitless)  -> RED
+ *   D  marginal explicit bias z=0.35 raw -3e-5 (eff -7.5e-6) vs sep 5e-6
+ *      (octave-aware margin: documents the r = 2^(e-23) law) -> RED
+ *   E  implicit decal rescue: base z=0.9, then blend-on/zwrite-off/bias-0
+ *      "decal" at z+2e-5 (models the cross-pass ULP mismatch). The
+ *      injected -1e-4 (eff -5e-5) must pull it in front       -> RED
+ *   F  no-overfire guard: same as E but z-write ON — the heuristic must
+ *      NOT fire, the decal must lose                          -> GREEN
  *
- * Band C (bottom third) — slope-scale pass-through (regression guard; the
- *   slope term is unitless in both APIs and must NOT get the constant
- *   term's format scale):
- *   6. green sloped base, z = 0.5 + 0.2*(x/W)  (dz/dx = 0.2/W per pixel)
- *   7. red   quad, same slope, z shifted +1e-4, SLOPESCALEDEPTHBIAS=-0.5:
- *        slope bias = -0.5 * 7.8125e-4 = -3.90625e-4; +1e-4 - 3.9e-4 < 0
- *        -> red wins iff the slope term is applied unscaled
- *
- * Probe pixels: (W/2, H/6), (W/2, H/2), (W/2, 5H/6). All three bands must
- * land their expected color for PASS. Results go to depthbias_out.txt;
- * PASS/FAIL also on stdout. Self-exits. */
+ * Probes at each band's center; the full tuple must match for PASS.
+ * Results in depthbias_out.txt; PASS/FAIL on stdout. Self-exits. */
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
@@ -79,7 +73,6 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
   return DefWindowProcA(h, m, w, l);
 }
 
-/* banded quad at constant depth */
 static void quad(struct Vertex v[6], float x0, float y0, float x1, float y1,
                  float z, DWORD color) {
   const struct Vertex tl = {x0, y0, z, 1.0f, color};
@@ -108,7 +101,7 @@ static DWORD floatBits(float f) {
 }
 
 int main(void) {
-  const UINT W = 256, H = 258; /* 3 x 86-pixel bands */
+  const UINT W = 256, H = 516; /* 6 x 86-pixel bands */
   const float bandH = 86.0f;
 
   g_out = fopen("depthbias_out.txt", "w");
@@ -155,19 +148,22 @@ int main(void) {
   CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE));
   CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_LIGHTING, FALSE));
   CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE));
+  CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_ONE));
+  CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_ZERO));
 
   IDirect3DSurface9 *sysmem = NULL;
   CHECK(IDirect3DDevice9_CreateOffscreenPlainSurface(
       dev, W, H, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sysmem, NULL));
 
   const DWORD biasZero = floatBits(0.0f);
-  const DWORD biasCoarse = floatBits(-0.0005f);  /* band A: 25x margin */
-  const DWORD biasMarginal = floatBits(-3e-5f);  /* band B: 1.33x margin */
-  const DWORD slopeHalfNeg = floatBits(-0.5f);   /* band C */
+  const DWORD biasCoarse = floatBits(-0.0005f);   /* A: 125x margin */
+  const DWORD biasMarginal = floatBits(-3e-5f);   /* B/D: 1.5x octave-aware */
+  const DWORD slopeHalfNeg = floatBits(-0.5f);    /* C */
 
   struct Vertex v[6];
   int frames = 0, verified = 0, ok = 0;
-  DWORD prev[3] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+  DWORD prev[6] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                   0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
   MSG msg;
   for (;;) {
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -183,40 +179,35 @@ int main(void) {
     CHECK(IDirect3DDevice9_BeginScene(dev));
     CHECK(IDirect3DDevice9_SetFVF(dev, FVF_QUAD));
 
-    /* ---- band A: y in [0, 86) — coarse-bias trio ---- */
+    /* ---- band A: coarse explicit bias trio ---- */
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
     quad(v, 0.0f, 0.0f, (float)W, bandH, 0.5f, 0xFF00FF00);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
-
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasCoarse));
     quad(v, 0.0f, 0.0f, (float)W, bandH, 0.500002f, 0xFFFF0000);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
-
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
     quad(v, 0.0f, 0.0f, (float)W, bandH, 0.6f, 0xFF0000FF);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
 
-    /* ---- band B: y in [86, 172) — marginal bias at z=0.9 ---- */
-    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+    /* ---- band B: marginal explicit bias, z=0.9 (eff raw/2) ---- */
     quad(v, 0.0f, bandH, (float)W, 2.0f * bandH, 0.9f, 0xFF00FF00);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
-
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasMarginal));
-    quad(v, 0.0f, bandH, (float)W, 2.0f * bandH, 0.9000225f, 0xFFFF0000);
+    quad(v, 0.0f, bandH, (float)W, 2.0f * bandH, 0.90001f, 0xFFFF0000);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
-
-    /* ---- band C: y in [172, 258) — slope-scale pass-through ---- */
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+
+    /* ---- band C: slope-scale pass-through ---- */
     slopeQuad(v, 0.0f, 2.0f * bandH, (float)W, 3.0f * bandH, 0.5f, 0.7f,
               0xFF00FF00);
     CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
                                            sizeof(struct Vertex)));
-
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_SLOPESCALEDEPTHBIAS,
                                           slopeHalfNeg));
     slopeQuad(v, 0.0f, 2.0f * bandH, (float)W, 3.0f * bandH, 0.5001f, 0.7001f,
@@ -226,12 +217,44 @@ int main(void) {
     CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_SLOPESCALEDEPTHBIAS,
                                           biasZero));
 
+    /* ---- band D: marginal explicit bias, z=0.35 (eff raw/4) ---- */
+    quad(v, 0.0f, 3.0f * bandH, (float)W, 4.0f * bandH, 0.35f, 0xFF00FF00);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasMarginal));
+    quad(v, 0.0f, 3.0f * bandH, (float)W, 4.0f * bandH, 0.350005f, 0xFFFF0000);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_DEPTHBIAS, biasZero));
+
+    /* ---- band E: implicit decal rescue (the WoW circle pattern) ---- */
+    quad(v, 0.0f, 4.0f * bandH, (float)W, 5.0f * bandH, 0.9f, 0xFF00FF00);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ZWRITEENABLE, FALSE));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE));
+    quad(v, 0.0f, 4.0f * bandH, (float)W, 5.0f * bandH, 0.90002f, 0xFFFF0000);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ZWRITEENABLE, TRUE));
+
+    /* ---- band F: guard — z-write ON must suppress the injection ---- */
+    quad(v, 0.0f, 5.0f * bandH, (float)W, 6.0f * bandH, 0.9f, 0xFF00FF00);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE));
+    quad(v, 0.0f, 5.0f * bandH, (float)W, 6.0f * bandH, 0.90002f, 0xFFFF0000);
+    CHECK(IDirect3DDevice9_DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 2, v,
+                                           sizeof(struct Vertex)));
+    CHECK(IDirect3DDevice9_SetRenderState(dev, D3DRS_ALPHABLENDENABLE, FALSE));
+
     CHECK(IDirect3DDevice9_EndScene(dev));
 
-    /* Poll the readback every frame: async pipeline compilation
-     * (D9MT_ASYNC / DXVK_ASYNC style) skips draws until the PSO is ready,
-     * so early frames legitimately show only the clear color. Verify as
-     * soon as SOMETHING drew; give up after ~600 frames. */
+    /* Poll the readback every frame: async pipeline compilation skips
+     * draws until the PSO is ready, so early frames legitimately show
+     * only the clear color. Verify once SOMETHING drew; give up after
+     * ~600 frames. */
     if (++frames >= 3 && !verified) {
       IDirect3DSurface9 *bb = NULL;
       CHECK(IDirect3DDevice9_GetBackBuffer(dev, 0, 0,
@@ -241,56 +264,58 @@ int main(void) {
 
       D3DLOCKED_RECT lr;
       CHECK(IDirect3DSurface9_LockRect(sysmem, &lr, NULL, D3DLOCK_READONLY));
-      const UINT probeY[3] = {43, 129, 215}; /* band centers */
-      DWORD rgb[3];
+      const UINT probeY[6] = {43, 129, 215, 301, 387, 473};
+      DWORD rgb[6];
       int i;
-      for (i = 0; i < 3; i++)
+      for (i = 0; i < 6; i++)
         rgb[i] = (*(const DWORD *)((const BYTE *)lr.pBits +
                                    probeY[i] * lr.Pitch + (W / 2) * 4)) &
                  0x00FFFFFF;
       IDirect3DSurface9_UnlockRect(sysmem);
 
-      /* Latch only after TWO consecutive frames agree on the full tuple:
-       * the quads share PSOs and the async compile can flip one hot
-       * between two draws of a single frame — that transition frame can
-       * show any subset of the layers. The frame after the flip has every
-       * draw live, so agreement across two frames screens the race out. */
-      const int anyDrawn = rgb[0] != 0x00101010 || rgb[1] != 0x00101010 ||
-                           rgb[2] != 0x00101010;
-      const int stable = rgb[0] == prev[0] && rgb[1] == prev[1] &&
-                         rgb[2] == prev[2];
+      /* Latch after TWO consecutive frames agree on the full tuple (the
+       * async PSO compile can flip hot mid-frame; the next frame has all
+       * draws live). */
+      int anyDrawn = 0, stable = 1;
+      for (i = 0; i < 6; i++) {
+        anyDrawn |= rgb[i] != 0x00101010;
+        stable &= rgb[i] == prev[i];
+      }
       if (anyDrawn && stable) {
         verified = 1;
-        LOG("probes: A=0x%06lx B=0x%06lx C=0x%06lx (frame %d)",
+        LOG("probes: A=0x%06lx B=0x%06lx C=0x%06lx D=0x%06lx E=0x%06lx "
+            "F=0x%06lx (frame %d)",
             (unsigned long)rgb[0], (unsigned long)rgb[1],
-            (unsigned long)rgb[2], frames);
-        int passA = rgb[0] == 0x00FF0000;
-        int passB = rgb[1] == 0x00FF0000;
-        int passC = rgb[2] == 0x00FF0000;
-        LOG("%s: band A coarse constant bias (25x margin) %s", passA ? "ok" : "FAIL",
-            passA ? "applied" : (rgb[0] == 0x0000FF00 ? "(decal lost to base layer)"
-                                                      : "(BROKEN depth test)"));
-        LOG("%s: band B marginal constant bias at z=0.9 (needs full 2^24 "
-            "float-depth scale) %s", passB ? "ok" : "FAIL",
-            passB ? "applied" : (rgb[1] == 0x0000FF00 ? "(underscaled: half-offset regime)"
-                                                      : "(BROKEN depth test)"));
-        LOG("%s: band C slope-scale bias pass-through %s", passC ? "ok" : "FAIL",
-            passC ? "applied" : (rgb[2] == 0x0000FF00 ? "(slope term lost)"
-                                                      : "(BROKEN depth test)"));
-        if (passA && passB && passC) {
-          LOG("PASS: DEPTHBIAS applied with D3D9 raw-offset semantics");
+            (unsigned long)rgb[2], (unsigned long)rgb[3],
+            (unsigned long)rgb[4], (unsigned long)rgb[5], frames);
+        const int pass[6] = {
+          rgb[0] == 0x00FF0000, rgb[1] == 0x00FF0000, rgb[2] == 0x00FF0000,
+          rgb[3] == 0x00FF0000, rgb[4] == 0x00FF0000,
+          rgb[5] == 0x0000FF00, /* F expects GREEN: injection suppressed */
+        };
+        LOG("%s: band A coarse explicit bias", pass[0] ? "ok" : "FAIL");
+        LOG("%s: band B marginal explicit bias z=0.9 (eff raw/2)",
+            pass[1] ? "ok" : "FAIL");
+        LOG("%s: band C slope-scale pass-through", pass[2] ? "ok" : "FAIL");
+        LOG("%s: band D marginal explicit bias z=0.35 (eff raw/4)",
+            pass[3] ? "ok" : "FAIL");
+        LOG("%s: band E implicit decal bias rescues the circle pattern",
+            pass[4] ? "ok" : "FAIL");
+        LOG("%s: band F z-write on suppresses the implicit bias",
+            pass[5] ? "ok" : "FAIL");
+        if (pass[0] && pass[1] && pass[2] && pass[3] && pass[4] && pass[5]) {
+          LOG("PASS: depth bias semantics + implicit decal bias correct");
           ok = 1;
         } else {
-          LOG("FAIL: depth bias semantics diverge from D3D9 (see bands above)");
+          LOG("FAIL: depth bias semantics diverge (see bands above)");
         }
       } else if (frames >= 600) {
         verified = 1;
         LOG("FAIL: no stable frame in %d frames (pipeline never ready?)",
             frames);
       } else {
-        prev[0] = rgb[0];
-        prev[1] = rgb[1];
-        prev[2] = rgb[2];
+        for (i = 0; i < 6; i++)
+          prev[i] = rgb[i];
       }
     }
 

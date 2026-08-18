@@ -813,38 +813,36 @@ namespace dxvk {
 
     features.extDepthClipEnable.depthClipEnable = VK_TRUE;
 
-    // extDepthBiasControl: advertise ONLY the force-unorm representation.
-    // floatRepresentation must stay off — it promises the front-end that
-    // the depth bias constant is added to z as a raw float (D3D9
-    // semantics), but the backend hands it verbatim to
-    // MTLRenderCommandEncoder setDepthBias, whose constant is in units of
-    // the least representable depth value. A raw D3D9 bias (order 1e-4)
-    // would become ~1e-4 * r ~= 0 — projected/decal geometry z-fights the
-    // base pass (WoW ground textures clip into terrain).
-    //
-    // For the Depth32Float buffers every D3D9 depth format maps to, Metal's
-    // unit r is NOT the constant 2^-23 the stock LEAST_REPRESENTABLE
-    // fallback assumes: measured on Apple GPUs (test/depthbias.c band B) it
-    // is the float-depth rule r = 2^(e-23), e = exponent of the primitive's
-    // z. WoW terrain sits at window z in [0.5,1) where e = -1, so the
-    // fallback's 2^23 pre-scale delivered HALF the game-requested offset —
-    // marginal decals (selection circles on uneven terrain) clipped as the
-    // camera moved z across the octave. Advertising
-    // leastRepresentableValueForceUnormRepresentation makes the front-end
-    // pre-scale by GetDepthBufferRValue(forceUnorm) = 2^24, which lands the
-    // exact D3D9 offset for z in [0.5,1) (raw * 2^24 * 2^-24), degrades to
-    // half only below z=0.25 octaves, and over-biases (2x, harmless) only
-    // at the far plane itself. The backend stores the representation enum
-    // and ignores it — Metal has no equivalent switch to flip.
+    // extDepthBiasControl must NOT be advertised — any of it would be a
+    // lie on this hardware:
+    //  - floatRepresentation promises the constant is added to z as a raw
+    //    float; Metal's setDepthBias applies least-representable units, so
+    //    a raw D3D9 bias (order 1e-4) would become ~0 (the payload-v2 bug:
+    //    explicit-bias decals z-fought their base pass).
+    //  - leastRepresentableValueForceUnormRepresentation promises a
+    //    CONSTANT r across the whole attachment; measured on Apple GPUs
+    //    (test/depthbias.c bands B+D, 2026-08-18) Metal's float-depth r is
+    //    2^(e-23) with e the exponent of the primitive's z — advertising
+    //    force-unorm (payload v9) merely doubled the bias octave-by-octave
+    //    while violating the constancy promise, and did nothing for WoW's
+    //    circles, which carry no app bias at all.
+    // Left unadvertised, the front-end pre-scales by 2^23 and Metal
+    // applies r = 2^(e-23) — exactly the LEAST_REPRESENTABLE float-depth
+    // semantics the Vulkan spec defines, and the same constant mtld3d
+    // ships. The resulting effective offset is raw * 2^e — the octave
+    // dependence is inherent to float depth; size margins per octave.
+    // WoW never sets DEPTHBIAS in gameplay: its ground decals rely on
+    // cross-pass z invariance instead, rescued by the implicit decal bias
+    // in D3D9DeviceEx::BindDepthBias (see the comment there).
     // Known residual: D16 surfaces get rValue 2^16 (the format the
     // front-end believes it uses) while the Metal buffer is Depth32Float,
     // leaving the constant bias ~2^7 too small on D16 — pre-existing, and
     // moot for the D24S8 path WoW uses.
-    // Regression test: test/depthbias.c (bands A/B/C).
-    features.extDepthBiasControl.depthBiasControl = VK_TRUE;
+    // Regression test: test/depthbias.c (bands A-F).
+    features.extDepthBiasControl.depthBiasControl = VK_FALSE;
     features.extDepthBiasControl.depthBiasExact   = VK_FALSE;
     features.extDepthBiasControl.floatRepresentation = VK_FALSE;
-    features.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
+    features.extDepthBiasControl.leastRepresentableValueForceUnormRepresentation = VK_FALSE;
 
     features.extRobustness2.robustBufferAccess2 = VK_TRUE;
     features.extRobustness2.nullDescriptor      = VK_TRUE;

@@ -136,6 +136,7 @@ namespace dxvk {
     m_usingGraphicsPipelines = dxvkDevice->features().extGraphicsPipelineLibrary.graphicsPipelineLibrary;
 
     // Check for VK_EXT_depth_bias_control and set up initial state
+    m_implicitDecalBias = env::getEnvVar("D9MT_DECAL_BIAS") != "0";
     m_depthBiasRepresentation = { VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT, false };
     if (dxvkDevice->features().extDepthBiasControl.depthBiasControl) {
       if (dxvkDevice->features().extDepthBiasControl.depthBiasExact)
@@ -2312,8 +2313,14 @@ namespace dxvk {
       states[State] = Value;
 
       switch (State) {
-        case D3DRS_SEPARATEALPHABLENDENABLE:
         case D3DRS_ALPHABLENDENABLE:
+          // blending gates the implicit decal bias (BindDepthBias)
+          if (likely(!Value != !oldValue))
+            m_flags.set(D3D9DeviceFlag::DirtyDepthBias);
+          m_flags.set(D3D9DeviceFlag::DirtyBlendState);
+          break;
+
+        case D3DRS_SEPARATEALPHABLENDENABLE:
         case D3DRS_BLENDOP:
         case D3DRS_BLENDOPALPHA:
         case D3DRS_DESTBLEND:
@@ -2371,6 +2378,8 @@ namespace dxvk {
               }
 
             m_flags.set(D3D9DeviceFlag::DirtyDepthStencilState);
+            // z-write gates the implicit decal bias (BindDepthBias)
+            m_flags.set(D3D9DeviceFlag::DirtyDepthBias);
           }
           break;
 
@@ -2388,6 +2397,8 @@ namespace dxvk {
             }
 
             m_flags.set(D3D9DeviceFlag::DirtyDepthStencilState);
+            // z-test gates the implicit decal bias (BindDepthBias)
+            m_flags.set(D3D9DeviceFlag::DirtyDepthBias);
           }
           break;
 
@@ -7281,6 +7292,27 @@ namespace dxvk {
 
     float depthBias            = bit::cast<float>(rs[D3DRS_DEPTHBIAS]) * m_depthBiasScale;
     float slopeScaledDepthBias = bit::cast<float>(rs[D3DRS_SLOPESCALEDEPTHBIAS]);
+
+    // Implicit decal bias (mirrored from mtld3d's looks_like_decal, the
+    // fix WoW's ground decals actually need): the client draws selection
+    // circles / blob shadows by re-rasterizing receiver geometry with
+    // additive blending, depth writes OFF and bias 0 under LESSEQUAL,
+    // relying on cross-pass z invariance no translation layer can
+    // guarantee — ULP-level transform differences make the decal flicker
+    // in and out of the terrain under camera motion. Native D3D9's
+    // coarser D24 quantization absorbed that noise; Depth32Float exposes
+    // it. Give exactly that state shape the polygon-offset pull it needs:
+    // constant -1e-4 (pre-scaled like an app bias would be) + slope -1.5,
+    // the standard GL/Vulkan polygon-offset pairing, magnitudes matching
+    // mtld3d's shipped tuning. D9MT_DECAL_BIAS=0 disables for in-game A/B.
+    if (m_implicitDecalBias
+     && rs[D3DRS_DEPTHBIAS] == 0u && rs[D3DRS_SLOPESCALEDEPTHBIAS] == 0u
+     && rs[D3DRS_ZENABLE] != D3DZB_FALSE
+     && !rs[D3DRS_ZWRITEENABLE]
+     && rs[D3DRS_ALPHABLENDENABLE]) {
+      depthBias            = -1e-4f * m_depthBiasScale;
+      slopeScaledDepthBias = -1.5f;
+    }
 
     DxvkDepthBias biases;
     biases.depthBiasConstant = depthBias;

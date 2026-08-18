@@ -74,12 +74,18 @@ anything touching dirty/Reset logic escalates to the full §8 discipline.
 
 ## Next v2 cuts, ranked
 
-1. **Phase 1 — POD staging, upload-ring slice** *(this branch)*. Evidence:
-   direct — the ring's `DxvkBufferSlice` return copies an `Rc<DxvkBuffer>`
-   (2 atomic ops per alloc/destroy) on a path already measured as part of the
-   per-draw submit cost; the pass-2 packed-slice change ("ONE ring allocation
-   + ONE track()") already showed the alloc/track collapse direction is right.
-   Small, behavior-identical, bounded blast radius.
+1. **Phase 1 — POD staging, upload-ring slice** *(LANDED, measured neutral)*.
+   Evidence: direct — the ring's `DxvkBufferSlice` return copies an
+   `Rc<DxvkBuffer>` (2 atomic ops per alloc/destroy) on a path already
+   measured as part of the per-draw submit cost; the pass-2 packed-slice
+   change ("ONE ring allocation + ONE track()") already showed the
+   alloc/track collapse direction is right. Small, behavior-identical,
+   bounded blast radius.
+   **Measured 2026-08-18** (xform, 16k draws, 6 interleaved pairs across two
+   sessions, both run orders): med_ms/submit_avg deltas flip sign between
+   pairs; neutral within this host's noise. Kept for the structural v2 value
+   (per-draw atomics removed from the ring path); correctness green across
+   consttest (8/8), depthbias, resettest, hdrtext-tag.
 2. **Phase 2 — per-frame residency dedupe.** Evidence: indirect — the v2
    testbed's per-frame `useResource` dedupe was worth landing there
    (`59c9e09`), and `markResident` runs per AB rebuild here; but per-encoder

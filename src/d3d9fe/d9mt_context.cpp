@@ -1578,6 +1578,11 @@ namespace dxvk::d9mt {
     VkImageAspectFlags  fbReadOnlyAspects = 0;
     uint32_t            fbLayerCount = 1u;
 
+    // HDR UI tag: RT0 is an alpha-dead RGB1 target (the X8 backbuffer) while
+    // the UI-aware HDR present is live, so the draw path steers each draw's
+    // alpha writes into the coverage tag (see updateGraphicsPipelineState).
+    bool                rt0UiTag = false;
+
     // occlusion queries currently inside begin/end (Queries stage): render
     // passes attach a visibility-result buffer while this is non-zero
     uint32_t            activeOcclusionCount = 0u;
@@ -2630,6 +2635,27 @@ namespace dxvk {
     if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
       clearValue.color = util::swizzleClearColor(clearValue.color,
         util::invertComponentMapping(imageView->info().unpackSwizzle()));
+    }
+
+    // UI coverage tag: the alpha-dead RGB1 backbuffer's spare channel must
+    // start every frame at 0 ("world"), whatever alpha the game's clear
+    // color carried. A color DISCARD is downgraded to a zero clear for the
+    // same reason — DontCare leaves garbage in the tag channel that world
+    // draws (alpha-masked, see updateGraphicsPipelineState) would never
+    // overwrite. Black is a legal realization of "undefined", so the game
+    // sees nothing new.
+    if (d9mt::hdrUiTagActive()) {
+      const bool alphaDead = d9mt::isUiTagBackbuffer(
+        obj_handle_t(imageView->image()->handle()));
+      if (alphaDead) {
+        if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT)
+          clearValue.color.float32[3] = 0.0f;
+        if (discardAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+          discardAspects &= ~VK_IMAGE_ASPECT_COLOR_BIT;
+          clearAspects |= VK_IMAGE_ASPECT_COLOR_BIT;
+          clearValue.color = VkClearColorValue { };
+        }
+      }
     }
 
     // Unconditionally defer; deferred clears are executed as standalone
@@ -4469,6 +4495,14 @@ namespace dxvk {
      || m_state.dyn.depthStencilState.depthCompareOp() != ds.depthCompareOp())
       m_flags.set(DxvkContextFlag::GpDirtyDepthTest);
 
+    // The UI coverage tag classifies draws by depthTest (see
+    // updateGraphicsPipelineState), which is otherwise dynamic-only state —
+    // a flip must re-run PSO selection or the previous draw's tag variant
+    // would stick.
+    if (m_state.dyn.depthStencilState.depthTest() != ds.depthTest()
+     && d9mt::ctxDrawStateImpl(this).rt0UiTag)
+      m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
+
     if (m_state.dyn.depthStencilState.stencilTest() != ds.stencilTest()
      || !m_state.dyn.depthStencilState.stencilOpFront().eq(ds.stencilOpFront())
      || !m_state.dyn.depthStencilState.stencilOpBack().eq(ds.stencilOpBack()))
@@ -4601,6 +4635,17 @@ namespace dxvk {
     dstate.fbHasDepth        = rt.depth.view != nullptr;
     dstate.fbReadOnlyAspects = readOnlyAspects;
     dstate.fbLayerCount      = layerCount;
+
+    // Arm the UI coverage tag only when RT0 is an alpha-dead backbuffer the
+    // HDR present has registered (attachment views are swizzle-less, so the
+    // RGB1 identity must come from the present side — see
+    // noteUiTagBackbuffer). Other targets keep stock alpha behavior — the
+    // tag machinery must never leak into offscreen rendering the game can
+    // read back meaningfully.
+    dstate.rt0UiTag = d9mt::hdrUiTagActive()
+                   && rt.color[0].view != nullptr
+                   && d9mt::isUiTagBackbuffer(
+                        obj_handle_t(rt.color[0].view->image()->handle()));
 
     m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
     m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
@@ -4859,6 +4904,33 @@ namespace dxvk {
     for (uint32_t i = 0; i < key.state.il.bindingCount(); i++) {
       uint32_t binding = key.state.ilBindings[i].binding();
       key.state.ilBindings[i].setStride(m_state.vi.vertexStrides[binding]);
+    }
+
+    // UI coverage tag (see ContextDrawState::rt0UiTag): steer this draw's
+    // alpha writes on the alpha-dead backbuffer. UI-classified draws
+    // (alpha-blended with the depth test off — the D3D9 interface pattern)
+    // accumulate their coverage additively into the spare channel for the
+    // UI-aware HDR present to read; everything else keeps alpha masked so
+    // world rendering cannot scribble over the tag. The mutation is part of
+    // the PSO key, so variants cache independently through the memo, the
+    // map, and the prewarm record with no extra key bits. Dual-source
+    // blending is left untouched (never the UI pattern; ONE/ONE alpha
+    // factors are not universally valid there).
+    if (dstate.rt0UiTag && !key.state.useDualSourceBlending()) {
+      const auto b = key.state.omBlend[0];
+      const bool uiDraw = b.blendEnable()
+                       && !m_state.dyn.depthStencilState.depthTest();
+      if (uiDraw) {
+        key.state.omBlend[0] = DxvkOmAttachmentBlend(b.blendEnable(),
+          b.srcColorBlendFactor(), b.dstColorBlendFactor(), b.colorBlendOp(),
+          VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
+          b.colorWriteMask() | VK_COLOR_COMPONENT_A_BIT);
+      } else {
+        key.state.omBlend[0] = DxvkOmAttachmentBlend(b.blendEnable(),
+          b.srcColorBlendFactor(), b.dstColorBlendFactor(), b.colorBlendOp(),
+          b.srcAlphaBlendFactor(), b.dstAlphaBlendFactor(), b.alphaBlendOp(),
+          b.colorWriteMask() & ~VK_COLOR_COMPONENT_A_BIT);
+      }
     }
 
     // Memo hit: same key as one of the last few distinct draws → reuse the

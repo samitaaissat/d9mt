@@ -298,6 +298,7 @@ struct d9mt_hdr_params {
   float p_hdr;           // 1 + 32*pow(l_hdr_nits/10000, 1/2.4)  [unread]
   float log2_p_hdr;      // log2(p_hdr)    -- replaces a pow()
   float inv_p_minus_one; // 1/(p_hdr - 1)  -- replaces a divide
+  float ui_nits;         // UI-tag branch: srgb_eotf(rgb) * ui_nits
 };
 
 // Reference / diffuse white in nits. Pinned to 100 (NOT the scRGB-conventional
@@ -496,6 +497,43 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
                   * d9mt_bt2446a_ictcp(d9mt_srgb_eotf(c.rgb), u);
   return float4(d9mt_pq_oetf(clamp(nits2020, 0.0f, 10000.0f)), c.a);
 }
+
+// UI-aware variants. src is the RAW backbuffer texture (not the RGB1 sample
+// view): .a carries the per-pixel UI coverage the draw path accumulated into
+// the X8 format's dead alpha channel. World pixels (tag 0) get the full
+// BT.2446-A curve; UI pixels (tag 1) get an SDR-faithful branch anchored at
+// ui_nits, so text keeps its authored antialiasing ramp instead of having
+// its white cores launched to the display peak (the "HDR text is blurry /
+// unantialiased" report — the core:edge luminance ratio triples when white
+// goes to peak while the AA midtones stay near SDR). The mix happens in
+// display-referred nits: both branches are exact at tag 0 and 1, and edge
+// pixels interpolate between the two exposures by coverage.
+fragment float4 d9mt_blit_ps_hdr_bt2446_ui(
+    d9mt_blit_vout in [[stage_in]],
+    constant d9mt_blit_params& p [[buffer(0)]],
+    texture2d<float> src [[texture(0)]],
+    constant d9mt_hdr_params& u [[buffer(2)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 c = src.sample(s, p.uv_offset + in.uv * p.uv_scale);
+  float3 lin = d9mt_srgb_eotf(c.rgb);
+  float3 world_nits = d9mt_bt2446a_ictcp(lin, u);
+  float3 ui_nits = lin * u.ui_nits;
+  float3 nits = mix(world_nits, ui_nits, saturate(c.a));
+  return float4(nits / D9MT_L_SDR, 1.0f);
+}
+
+fragment float4 d9mt_blit_ps_hdr_bt2446_ui_pq(
+    d9mt_blit_vout in [[stage_in]],
+    constant d9mt_blit_params& p [[buffer(0)]],
+    texture2d<float> src [[texture(0)]],
+    constant d9mt_hdr_params& u [[buffer(2)]]) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float4 c = src.sample(s, p.uv_offset + in.uv * p.uv_scale);
+  float3 lin = d9mt_srgb_eotf(c.rgb);
+  float3 nits = mix(d9mt_bt2446a_ictcp(lin, u), lin * u.ui_nits, saturate(c.a));
+  float3 nits2020 = D9MT_M_BT709_TO_BT2020 * nits;
+  return float4(d9mt_pq_oetf(clamp(nits2020, 0.0f, 10000.0f)), 1.0f);
+}
 )";
 
     std::mutex   s_blitMutex;
@@ -510,6 +548,8 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     obj_handle_t s_blitPsHdrPassthroughPq = 0;
     obj_handle_t s_blitPsHdrBt2446 = 0;
     obj_handle_t s_blitPsHdrBt2446Pq = 0;
+    obj_handle_t s_blitPsHdrBt2446Ui = 0;
+    obj_handle_t s_blitPsHdrBt2446UiPq = 0;
     std::vector<std::pair<uint32_t, obj_handle_t>> s_blitPsoCache;
 
     // d9mtmetal ABI handshake result, smuggled out of the newLibrary call.
@@ -523,7 +563,8 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     bool ensureBlitFunctionsLocked() {
       if (s_blitVs && s_blitPs && s_blitPsPoint && s_blitPsGamma && s_blitPsPointGamma
        && s_blitPsHdrPassthrough && s_blitPsHdrPassthroughPq
-       && s_blitPsHdrBt2446 && s_blitPsHdrBt2446Pq)
+       && s_blitPsHdrBt2446 && s_blitPsHdrBt2446Pq
+       && s_blitPsHdrBt2446Ui && s_blitPsHdrBt2446UiPq)
         return true;
       if (s_blitInitFailed)
         return false;
@@ -568,10 +609,13 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
       s_blitPsHdrPassthroughPq = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_passthrough_pq");
       s_blitPsHdrBt2446 = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446");
       s_blitPsHdrBt2446Pq = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446_pq");
+      s_blitPsHdrBt2446Ui = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446_ui");
+      s_blitPsHdrBt2446UiPq = MTLLibrary_newFunction(s_blitLibrary, "d9mt_blit_ps_hdr_bt2446_ui_pq");
 
       if (!s_blitVs || !s_blitPs || !s_blitPsPoint || !s_blitPsGamma || !s_blitPsPointGamma
        || !s_blitPsHdrPassthrough || !s_blitPsHdrPassthroughPq
-       || !s_blitPsHdrBt2446 || !s_blitPsHdrBt2446Pq) {
+       || !s_blitPsHdrBt2446 || !s_blitPsHdrBt2446Pq
+       || !s_blitPsHdrBt2446Ui || !s_blitPsHdrBt2446UiPq) {
         Logger::err("d9mt: blitter: blit functions missing from compiled library");
         s_blitInitFailed = true;
         return false;
@@ -623,6 +667,8 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
       case HdrMode::PassthroughPq: info.fragment_function = s_blitPsHdrPassthroughPq; break;
       case HdrMode::Bt2446:        info.fragment_function = s_blitPsHdrBt2446;        break;
       case HdrMode::Bt2446Pq:      info.fragment_function = s_blitPsHdrBt2446Pq;      break;
+      case HdrMode::Bt2446Ui:      info.fragment_function = s_blitPsHdrBt2446Ui;      break;
+      case HdrMode::Bt2446UiPq:    info.fragment_function = s_blitPsHdrBt2446UiPq;    break;
       case HdrMode::None:
         info.fragment_function = useGamma ? (pointFilter ? s_blitPsPointGamma : s_blitPsGamma)
                                           : (pointFilter ? s_blitPsPoint : s_blitPs);
@@ -665,7 +711,7 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
 
   namespace {
 
-    enum class HdrEnv : uint32_t { Off = 0, On = 1, Auto = 2 };
+    enum class HdrEnv : uint32_t { Off = 0, On = 1, Auto = 2, Force = 3 };
     enum class HdrSpace : uint32_t { Display = 0, ScRgb = 1, Pq = 2 };
 
     std::atomic<bool>     s_hdrActive     = { false };
@@ -701,9 +747,13 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
           return HdrEnv::Off;
         if (v == "1" || v == "on" || v == "true" || v == "yes")  return HdrEnv::On;
         if (v == "auto")                                        return HdrEnv::Auto;
+        // force: latch the gate active without EDR headroom — validation /
+        // debugging only (on an SDR panel the compositor clips everything
+        // above 1.0; pair with D9MT_HDR_PEAK to pin the curve).
+        if (v == "force")                                       return HdrEnv::Force;
         if (v == "0" || v == "off" || v == "false" || v == "no") return HdrEnv::Off;
         Logger::warn(str::format("d9mt: hdr: D9MT_HDR='", v,
-          "' not recognised (want 0/1/auto) - treating as off"));
+          "' not recognised (want 0/1/auto/force) - treating as off"));
         return HdrEnv::Off;
       }();
       return mode;
@@ -746,6 +796,40 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
         return 0.0f;
       }();
       return peak;
+    }
+
+    // D9MT_HDR_UI: mix the UI's dead-alpha coverage tag into present so text
+    // and interface stay SDR-anchored while the world gets the full curve.
+    // Default ON — the flat curve launches white UI text to the display peak
+    // while its antialiasing midtones stay near SDR, which reads as blurry,
+    // unantialiased text (the field report this ships for). 0 restores strict
+    // mtld3d parity.
+    bool hdrUiEnvEnabled() {
+      static const bool enabled = [] {
+        std::string v = envLower("D9MT_HDR_UI");
+        if (v.empty())
+          return true;
+        return !(v == "0" || v == "off" || v == "false" || v == "no");
+      }();
+      return enabled;
+    }
+
+    // D9MT_HDR_UI_NITS: the UI branch's white anchor. 200 keeps interface
+    // white at 2x SDR reference — bright enough to not look grey next to EDR
+    // world highlights, dim enough to keep the AA ramp legible.
+    float hdrUiEnvNits() {
+      static const float nits = [] {
+        std::string v = envLower("D9MT_HDR_UI_NITS");
+        if (v.empty())
+          return 200.0f;
+        double n = std::atof(v.c_str());
+        if (n >= 80.0 && n <= 1000.0)
+          return float(n);
+        Logger::warn(str::format("d9mt: hdr: D9MT_HDR_UI_NITS='", v,
+          "' out of range (want 80..1000 nits) - using 200"));
+        return 200.0f;
+      }();
+      return nits;
     }
 
     // True once a d9mtmetal.so new enough to carry the HDR entry points has
@@ -828,8 +912,33 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
   // present, one unixcall that only reads published statics and queues a
   // main-queue block. mtld3d uses the same 32-present cadence.
   void refreshHdrHeadroom(obj_handle_t layer) {
-    if (!s_hdrActive.load(std::memory_order_relaxed))
+    if (!s_hdrActive.load(std::memory_order_relaxed)) {
+      // SDR-latched retry. The gate can legitimately read a PUBLISHED
+      // potential of 1.0 and latch HDR off when the window has not been
+      // assigned its real screen yet (fresh explorer start, or the window
+      // later moves to an EDR display) — the published guard cannot tell
+      // "no headroom" from "wrong screen". So while the user asked for HDR,
+      // keep probing on the same 32-present cadence as the active path and
+      // unlatch the gate the moment the panel shows potential; the next
+      // acquire re-runs the gate against the now-correct screen. Default-off
+      // users pay nothing (env check first).
+      if (hdrEnvMode() == HdrEnv::Off
+       || !s_hdrLatched.load(std::memory_order_relaxed))
+        return;
+      uint32_t n = s_hdrPresents.fetch_add(1u, std::memory_order_relaxed);
+      if ((n % 32u) != 0u)
+        return;
+      float cur = 1.0f, potential = 1.0f;
+      bool published = false;
+      if (!queryLayerEdr(layer, D9MT_EDR_REFRESH_ASYNC, &cur, &potential, &published))
+        return;
+      if (published && potential > 1.0f) {
+        Logger::info(str::format("d9mt: hdr: potential headroom ", potential,
+          "x appeared after an SDR latch - re-running the gate"));
+        s_hdrLatched.store(false, std::memory_order_relaxed);
+      }
       return;
+    }
 
     // Only cross into the unixlib on a due present. The call itself is cheap
     // (it reads published statics) but this driver is CPU-bound and a PE->unix
@@ -899,6 +1008,12 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
 
       bool active = haveEdr && std::isfinite(potential) && potential > 1.0f;
 
+      if (hdrEnvMode() == HdrEnv::Force && haveEdr && !active) {
+        Logger::warn("d9mt: hdr: FORCED active without EDR headroom "
+                     "(D9MT_HDR=force) - expect clipped highlights on SDR panels");
+        active = true;
+      }
+
       if (!haveEdr) {
         Logger::warn("d9mt: hdr: requested, but this d9mtmetal has no main-queue "
                      "EDR entry point (stale unixlib) - running SDR");
@@ -943,7 +1058,40 @@ fragment float4 d9mt_blit_ps_hdr_bt2446_pq(
     u.pHdr         = 1.0f + 32.0f * std::pow(u.lHdrNits / 10000.0f, 1.0f / 2.4f);
     u.log2PHdr     = std::log2(u.pHdr);
     u.invPMinusOne = 1.0f / (u.pHdr - 1.0f);
+    u.uiNits       = hdrUiEnvNits();
     return u;
+  }
+
+  bool hdrUiTagActive() {
+    return hdrUiEnvEnabled() && hdrLayerActive();
+  }
+
+  float hdrUiNits() { return hdrUiEnvNits(); }
+
+  namespace {
+    // Ring of backbuffer image handles present has tone-mapped in UI mode.
+    // Lock-free: written only from the CS thread (present), read from the
+    // CS thread (draw path) — the atomics are for hygiene, not contention.
+    constexpr size_t UiTagRingSize = 4;
+    std::atomic<uint64_t> s_uiTagImages[UiTagRingSize] = { };
+    std::atomic<uint32_t> s_uiTagNext = { 0u };
+  }
+
+  void noteUiTagBackbuffer(obj_handle_t image) {
+    for (size_t i = 0; i < UiTagRingSize; i++) {
+      if (s_uiTagImages[i].load(std::memory_order_relaxed) == image)
+        return;
+    }
+    uint32_t slot = s_uiTagNext.fetch_add(1u, std::memory_order_relaxed) % UiTagRingSize;
+    s_uiTagImages[slot].store(image, std::memory_order_relaxed);
+  }
+
+  bool isUiTagBackbuffer(obj_handle_t image) {
+    for (size_t i = 0; i < UiTagRingSize; i++) {
+      if (s_uiTagImages[i].load(std::memory_order_relaxed) == image)
+        return true;
+    }
+    return false;
   }
 
 
@@ -1752,6 +1900,29 @@ namespace dxvk {
               ? (pq ? d9mt::HdrMode::Bt2446Pq      : d9mt::HdrMode::Bt2446)
               : (pq ? d9mt::HdrMode::PassthroughPq : d9mt::HdrMode::Passthrough);
 
+      // UI-aware curve: engages only when the source is a 1-sample image
+      // whose view carries the RGB1 swizzle of an alpha-dead X8 format —
+      // exactly the case where the draw path may have written its UI
+      // coverage tag into the spare channel. The shader then needs the RAW
+      // image (the swizzled sample view pins .a to 1), so rebind the source
+      // to the image itself; .rgb reads identically through either. MSAA
+      // sources are excluded — the resolve pass below goes through the
+      // swizzled view and would average an untagged alpha.
+      if (hdrPeakValue > 1.0f && d9mt::hdrUiTagActive()
+       && srcView->image()->info().sampleCount == VK_SAMPLE_COUNT_1_BIT) {
+        VkComponentMapping m = srcView->info().unpackSwizzle();
+        if (m.a == VK_COMPONENT_SWIZZLE_ONE
+         && m.r == VK_COMPONENT_SWIZZLE_R
+         && m.g == VK_COMPONENT_SWIZZLE_G
+         && m.b == VK_COMPONENT_SWIZZLE_B) {
+          hdrMode = pq ? d9mt::HdrMode::Bt2446UiPq : d9mt::HdrMode::Bt2446Ui;
+          srcHandle = obj_handle_t(srcView->image()->handle());
+          // Teach the draw path which image carries the tag — the attachment
+          // views it sees are swizzle-less, so it cannot detect RGB1 itself.
+          d9mt::noteUiTagBackbuffer(srcHandle);
+        }
+      }
+
       // Gamma and HDR are mutually exclusive, HDR wins (DXMT takes the same
       // posture). Applying the ramp first would feed a display-referred LUT
       // into an inverse tone map as if it were scene luminance; applying it
@@ -1935,7 +2106,9 @@ namespace dxvk {
     // buffer(2). Gamma and HDR are mutually exclusive, so the chain never
     // carries both.
     const bool needsHdrBytes = hdrMode == d9mt::HdrMode::Bt2446
-                            || hdrMode == d9mt::HdrMode::Bt2446Pq;
+                            || hdrMode == d9mt::HdrMode::Bt2446Pq
+                            || hdrMode == d9mt::HdrMode::Bt2446Ui
+                            || hdrMode == d9mt::HdrMode::Bt2446UiPq;
     d9mt::HdrParams hdrParams = { };
     if (needsHdrBytes)
       hdrParams = d9mt::hdrParamsForPeak(hdrPeakValue);

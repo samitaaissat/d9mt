@@ -217,15 +217,24 @@ namespace dxvk::d9mt {
     Bt2446        = 2,
     PassthroughPq = 3,
     Bt2446Pq      = 4,
+    // UI-aware variants: the backbuffer's dead alpha channel (RGB1-swizzled
+    // X8 formats) carries per-pixel UI coverage written by the draw path;
+    // present mixes the BT.2446-A world curve against an SDR-anchored UI
+    // branch by that tag. getBlitPso packs hdrMode into 3 key bits — keep
+    // this enum within [0,7].
+    Bt2446Ui      = 5,
+    Bt2446UiPq    = 6,
   };
 
   // Uniform block for the HDR fragments, bound at fragment buffer(2).
-  // Byte-identical to mtld3d's HdrUniforms.
+  // First four fields byte-identical to mtld3d's HdrUniforms; uiNits extends
+  // the block for the UI-aware variants (unread by the parity modes).
   struct HdrParams {
     float lHdrNits;      // live EDR headroom * 100
     float pHdr;          // 1 + 32*pow(lHdrNits/10000, 1/2.4)   [unread by GPU]
     float log2PHdr;      // log2(pHdr)
     float invPMinusOne;  // 1/(pHdr - 1)
+    float uiNits;        // UI branch target: srgb_eotf(rgb) * uiNits
   };
 
   obj_handle_t getBlitPso(WMTPixelFormat dstFormat, bool pointFilter = false,
@@ -243,6 +252,20 @@ namespace dxvk::d9mt {
   bool     hdrEvaluateGate(obj_handle_t layer);
   bool     hdrGateLatched();
   void     hdrApplyColorSpace(obj_handle_t layer);
+  // hdrUiTagActive(): HDR present is live AND the UI tag (D9MT_HDR_UI,
+  // default on) is enabled — the draw path arms its alpha-tag plumbing off
+  // this. hdrUiNits(): the SDR-anchored UI luminance target (D9MT_HDR_UI_NITS,
+  // default 200).
+  bool     hdrUiTagActive();
+  float    hdrUiNits();
+  // The UI-tag backbuffer registry. Only the PRESENT side can identify the
+  // alpha-dead backbuffer (the RGB1 swizzle lives on the sample view; the
+  // attachment views the draw path sees are swizzle-less), so present
+  // records each RGB1 backbuffer IMAGE it tone-maps and the draw path arms
+  // its tag plumbing by image identity. Small ring — swapchains rotate
+  // through at most a few images.
+  void     noteUiTagBackbuffer(obj_handle_t image);
+  bool     isUiTagBackbuffer(obj_handle_t image);
 
   // Depth(+stencil) SAMPLE_ZERO resolve PSO (d9mt_presenter.cpp): fullscreen
   // triangle exporting [[depth(any)]] (+ [[stencil]]) read from sample 0 of

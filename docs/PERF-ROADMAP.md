@@ -152,6 +152,26 @@ Virtualization.framework VM at 267% plus concurrent swift builds. At load 20-52
 medians ranging 4.5-62 ms. Gate on `sysctl -n vm.loadavg < 6` and check p99
 clustering before trusting anything.
 
+## Pass 5 host probe — encoder create/end is FIXED cost; the lever is fewer restarts
+
+`tools/probe-encoder-cost.mm` (host-native, no wine; M5, 512 restarts/frame,
+120 frames/variant, interleaved) measured `renderCommandEncoderWithDescriptor:`
++ `endEncoding` at a fixed **~9.5us per restart pair** and showed it does NOT
+respond to any encoder-mode knob:
+
+- `MTLResourceHazardTrackingModeUntracked` on the RTs (+ a correct MTLFence
+  ladder): within noise.
+- `commandBufferWithUnretainedReferences`: within noise.
+- Referenced-resource count (8 vs 256 per pass): create/end unchanged; the
+  `useResource` declarations themselves cost ~16 ns/resource/pass — a real
+  tax only at counts WoW never reaches.
+
+Together with the pass-4 negative (descriptor construction), this closes the
+book on making restarts cheaper: **the remaining shadow-pattern lever is
+issuing fewer restarts** — deferring the main-pass reopen across shadow-RT
+interludes so its encoder is created once per batch instead of per round-trip
+(see D9MT_PASS_DEFER if landed, else the pass-defer branch).
+
 ## Validation gaps (pass 3) — must close before shipping
 
 - spectest is env-blocked machine-wide this pass (no 3.3.5a client
